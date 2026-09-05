@@ -51,10 +51,12 @@ func TestSetResponseHeaderTimeout(t *testing.T) {
 
 func TestOpenCodeNativeProtocols(t *testing.T) {
 	zen := map[string]Protocol{
-		"gpt-5.5":           ProtocolResponses,
-		"claude-opus-4.6":   ProtocolMessages,
-		"deepseek-v4-flash": ProtocolChat,
-		"unknown-model":     ProtocolChat,
+		"gpt-5.5":            ProtocolResponses,
+		"claude-opus-4.6":    ProtocolMessages,
+		"deepseek-v4-flash":  ProtocolChat,
+		"unknown-model":      ProtocolChat,
+		"gpt-5.7":            ProtocolResponses,
+		"new-response-model": ProtocolResponses,
 	}
 	for modelID, want := range zen {
 		if got := nativeProtocol("opencode-zen", modelID); got != want {
@@ -74,6 +76,8 @@ func TestOpenCodeNativeProtocols(t *testing.T) {
 		"deepseek-v4-flash-free":          ProtocolChat,
 		"mimo-v2.5-free":                  ProtocolChat,
 		"unlisted-model-free":             ProtocolChat,
+		"gpt-5.7-free":                    ProtocolResponses,
+		"new-response-model-free":         ProtocolResponses,
 	}
 	for modelID, want := range freeModels {
 		if got := nativeProtocol("opencode-free", modelID); got != want {
@@ -407,6 +411,278 @@ func TestOllamaDiscoveryCapturesContextLength(t *testing.T) {
 	if models[2].ID != "deepseek-v4-flash:0731" || models[2].ContextLength != 1048576 {
 		t.Fatalf("deepseek-v4-flash:0731 architecture context not captured: %+v", models[2])
 	}
+}
+
+func TestParseReasoningCapabilitiesOpenRouter(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  map[string]any
+		want *ReasoningCapabilities
+	}{
+		{
+			name: "full reasoning object",
+			raw: map[string]any{
+				"supported_efforts":    []any{"low", "medium", "high"},
+				"default_effort":       "medium",
+				"mandatory":            true,
+				"default_enabled":      false,
+				"supports_max_tokens":  true,
+				"supported_parameters": []any{"reasoning", "reasoning_effort", "include_reasoning"},
+			},
+			want: &ReasoningCapabilities{
+				Options: []ReasoningOption{
+					{Type: ReasoningOptionEffort, Values: []string{"low", "medium", "high"}},
+					{Type: ReasoningOptionBudgetTokens},
+				},
+				DefaultEffort:  "medium",
+				Mandatory:      boolPtr(true),
+				DefaultEnabled: boolPtr(false),
+				Parameters:     []string{"reasoning", "reasoning_effort", "include_reasoning"},
+			},
+		},
+		{
+			name: "nil reasoning object",
+			raw:  nil,
+			want: nil,
+		},
+		{
+			name: "empty reasoning object",
+			raw:  map[string]any{},
+			want: nil,
+		},
+		{
+			name: "supported_efforts null (all gateway efforts accepted)",
+			raw:  map[string]any{"supported_efforts": nil, "default_effort": "medium"},
+			want: &ReasoningCapabilities{
+				Options:       []ReasoningOption{{Type: ReasoningOptionEffort}},
+				DefaultEffort: "medium",
+			},
+		},
+		{
+			name: "supported_efforts absent (no effort selector)",
+			raw:  map[string]any{"default_effort": "medium"},
+			want: &ReasoningCapabilities{
+				DefaultEffort: "medium",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := openRouterReasoning(tc.raw, nil)
+			if tc.want == nil {
+				if got != nil {
+					t.Fatalf("expected nil, got %+v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("expected %+v, got nil", tc.want)
+			}
+			if len(got.Options) != len(tc.want.Options) {
+				t.Fatalf("options count = %d, want %d: got %+v, want %+v", len(got.Options), len(tc.want.Options), got.Options, tc.want.Options)
+			}
+			for i, opt := range got.Options {
+				if opt.Type != tc.want.Options[i].Type {
+					t.Errorf("option[%d].Type = %q, want %q", i, opt.Type, tc.want.Options[i].Type)
+				}
+				if !slicesEqual(opt.Values, tc.want.Options[i].Values) {
+					t.Errorf("option[%d].Values = %v, want %v", i, opt.Values, tc.want.Options[i].Values)
+				}
+			}
+			if got.DefaultEffort != tc.want.DefaultEffort {
+				t.Errorf("default_effort = %q, want %q", got.DefaultEffort, tc.want.DefaultEffort)
+			}
+			if !boolPtrEqual(got.Mandatory, tc.want.Mandatory) {
+				t.Errorf("mandatory = %v, want %v", got.Mandatory, tc.want.Mandatory)
+			}
+			if !boolPtrEqual(got.DefaultEnabled, tc.want.DefaultEnabled) {
+				t.Errorf("default_enabled = %v, want %v", got.DefaultEnabled, tc.want.DefaultEnabled)
+			}
+			if !slicesEqual(got.Parameters, tc.want.Parameters) {
+				t.Errorf("parameters = %v, want %v", got.Parameters, tc.want.Parameters)
+			}
+		})
+	}
+}
+
+func TestParseReasoningCapabilitiesAnthropic(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  map[string]any
+		want *ReasoningCapabilities
+	}{
+		{
+			name: "effort levels and legacy thinking toggle",
+			raw: map[string]any{
+				"effort": map[string]any{
+					"low":    map[string]any{"supported": true},
+					"medium": map[string]any{"supported": true},
+					"high":   map[string]any{"supported": false},
+				},
+				"thinking": map[string]any{"supported": true},
+			},
+			want: &ReasoningCapabilities{Options: []ReasoningOption{
+				{Type: ReasoningOptionEffort, Values: []string{"low", "medium"}},
+				{Type: ReasoningOptionToggle},
+			}},
+		},
+		{
+			name: "effort with adaptive and enabled thinking types",
+			raw: map[string]any{
+				"effort": map[string]any{
+					"low":    map[string]any{"supported": true},
+					"medium": map[string]any{"supported": true},
+				},
+				"thinking": map[string]any{
+					"types": map[string]any{
+						"adaptive": map[string]any{"supported": true},
+						"enabled":  map[string]any{"supported": false},
+					},
+				},
+			},
+			want: &ReasoningCapabilities{
+				Options:       []ReasoningOption{{Type: ReasoningOptionEffort, Values: []string{"low", "medium"}}},
+				ThinkingModes: []string{"adaptive"},
+			},
+		},
+		{
+			name: "nil capabilities",
+			raw:  nil,
+			want: nil,
+		},
+		{
+			name: "empty capabilities",
+			raw:  map[string]any{},
+			want: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := anthropicReasoning(tc.raw)
+			if tc.want == nil {
+				if got != nil {
+					t.Fatalf("expected nil, got %+v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("expected %+v, got nil", tc.want)
+			}
+			if len(got.Options) != len(tc.want.Options) {
+				t.Fatalf("options count = %d, want %d", len(got.Options), len(tc.want.Options))
+			}
+			for i, opt := range got.Options {
+				if opt.Type != tc.want.Options[i].Type {
+					t.Errorf("option[%d].Type = %q, want %q", i, opt.Type, tc.want.Options[i].Type)
+				}
+				if !slicesEqual(opt.Values, tc.want.Options[i].Values) {
+					t.Errorf("option[%d].Values = %v, want %v", i, opt.Values, tc.want.Options[i].Values)
+				}
+			}
+			if !slicesEqual(got.ThinkingModes, tc.want.ThinkingModes) {
+				t.Errorf("thinking modes = %v, want %v", got.ThinkingModes, tc.want.ThinkingModes)
+			}
+		})
+	}
+}
+
+func TestPagedDiscoveryCapturesOpenRouterReasoning(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{
+			map[string]any{
+				"id": "model-a",
+				"reasoning": map[string]any{
+					"supported_efforts":   []any{"low", "medium", "high"},
+					"default_effort":      "medium",
+					"supports_max_tokens": true,
+				},
+			},
+			map[string]any{"id": "model-b"},
+		}})
+	}))
+	defer upstream.Close()
+	models, err := NewRegistry().Discover(context.Background(), Instance{Type: "openrouter", BaseURL: upstream.URL + "/v1", Credential: "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 2 {
+		t.Fatalf("expected 2 models, got %d", len(models))
+	}
+	a := models[0]
+	if a.ReasoningCapabilities == nil {
+		t.Fatal("expected reasoning capabilities for model-a")
+	}
+	if len(a.ReasoningCapabilities.Options) != 2 {
+		t.Fatalf("expected 2 options, got %d", len(a.ReasoningCapabilities.Options))
+	}
+	if a.ReasoningCapabilities.Options[0].Type != ReasoningOptionEffort {
+		t.Errorf("option[0].Type = %q, want effort", a.ReasoningCapabilities.Options[0].Type)
+	}
+	if !slicesEqual(a.ReasoningCapabilities.Options[0].Values, []string{"low", "medium", "high"}) {
+		t.Errorf("effort values = %v, want [low medium high]", a.ReasoningCapabilities.Options[0].Values)
+	}
+	if a.ReasoningCapabilities.Options[1].Type != ReasoningOptionBudgetTokens {
+		t.Errorf("option[1].Type = %q, want budget_tokens", a.ReasoningCapabilities.Options[1].Type)
+	}
+	if a.ReasoningCapabilities.DefaultEffort != "medium" {
+		t.Errorf("default_effort = %q, want medium", a.ReasoningCapabilities.DefaultEffort)
+	}
+	// model-b has no reasoning metadata -> ReasoningCapabilities stays nil.
+	if models[1].ReasoningCapabilities != nil {
+		t.Errorf("model-b reasoning capabilities should be nil, got %+v", models[1].ReasoningCapabilities)
+	}
+}
+
+func TestPagedDiscoveryCapturesAnthropicReasoning(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{
+			map[string]any{
+				"id": "claude-opus-5",
+				"capabilities": map[string]any{
+					"effort": map[string]any{
+						"low":    map[string]any{"supported": true},
+						"medium": map[string]any{"supported": true},
+						"high":   map[string]any{"supported": true},
+					},
+					"thinking": map[string]any{"supported": true},
+				},
+			},
+		}})
+	}))
+	defer upstream.Close()
+	models, err := NewRegistry().Discover(context.Background(), Instance{Type: "anthropic", BaseURL: upstream.URL + "/v1", Credential: "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(models))
+	}
+	m := models[0]
+	if m.ReasoningCapabilities == nil {
+		t.Fatal("expected reasoning capabilities for claude-opus-5")
+	}
+	if len(m.ReasoningCapabilities.Options) != 2 {
+		t.Fatalf("expected 2 options, got %d", len(m.ReasoningCapabilities.Options))
+	}
+	if m.ReasoningCapabilities.Options[0].Type != ReasoningOptionEffort {
+		t.Errorf("option[0].Type = %q, want effort", m.ReasoningCapabilities.Options[0].Type)
+	}
+	if !slicesEqual(m.ReasoningCapabilities.Options[0].Values, []string{"low", "medium", "high"}) {
+		t.Errorf("effort values = %v", m.ReasoningCapabilities.Options[0].Values)
+	}
+	if m.ReasoningCapabilities.Options[1].Type != ReasoningOptionToggle {
+		t.Errorf("option[1].Type = %q, want toggle", m.ReasoningCapabilities.Options[1].Type)
+	}
+}
+
+func boolPtrEqual(a, b *bool) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
 }
 
 func TestValidateBaseURL(t *testing.T) {

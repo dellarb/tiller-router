@@ -77,6 +77,7 @@ type activityView struct {
 	AttemptCount             int     `json:"attempt_count"`
 	FallbackUsed             bool    `json:"fallback_used"`
 	FallbackReason           *string `json:"fallback_reason"`
+	WarningCode              *string `json:"warning_code,omitempty"`
 	CreatedAt                string  `json:"created_at"`
 }
 
@@ -150,8 +151,7 @@ type globalActivityView struct {
 }
 
 // listGlobalActivity returns recent request metadata across all client keys,
-// newest first, with a deterministic id secondary sort. It is read-only and
-// returns metadata plus bodies only when sensitive error logging is enabled.
+// newest first, with a deterministic id secondary sort.
 func (s *Server) listGlobalActivity(w http.ResponseWriter, r *http.Request) {
 	limit, offset, search := pagination(r)
 	pattern := "%" + search + "%"
@@ -276,10 +276,8 @@ func (s *Server) exportVirtualActivityCSV(w http.ResponseWriter, r *http.Request
 	writeActivityCSV(w, r, "tiller-"+sanitizeFilename(canonical)+"-activity-"+time.Now().UTC().Format("2006-01-02")+".csv", rows)
 }
 
-// exportRealModelActivityCSV streams a CSV of activity that
-// resolved to a real model (resolved_provider + resolved_model), honouring the
-// active search filter. Scoping by resolved names keeps legacy rows and
-// virtual-routed requests visible. One inference request = one row.
+// exportRealModelActivityCSV streams a CSV of activity attributable to a real
+// model, honouring the active search filter. One inference request = one row.
 func (s *Server) exportRealModelActivityCSV(w http.ResponseWriter, r *http.Request) {
 	modelID := r.PathValue("id")
 	var provider, upstream string
@@ -287,7 +285,7 @@ func (s *Server) exportRealModelActivityCSV(w http.ResponseWriter, r *http.Reque
 		adminError(w, 404, "not_found", "Model not found.")
 		return
 	}
-	where, args := realAttribution(provider, upstream)
+	where, args := realAttribution(modelID, provider, upstream)
 	if search := strings.TrimSpace(r.URL.Query().Get("search")); search != "" {
 		pattern := "%" + search + "%"
 		where += ` AND (rl.requested_model LIKE ? OR coalesce(rl.exposed_model,'') LIKE ? OR coalesce(rl.route_model,'') LIKE ? OR coalesce(rl.resolved_provider,'') LIKE ? OR CAST(rl.http_status AS TEXT) LIKE ? OR coalesce(rl.error_text,'') LIKE ? OR coalesce(rl.error_message,'') LIKE ?)`
@@ -315,7 +313,7 @@ func writeActivityCSV(w http.ResponseWriter, r *http.Request, filename string, r
 		"timestamp", "client_key", "client_requested_model", "client_exposed_model",
 		"virtual_model", "bound_target", "final_provider", "final_model", "protocol",
 		"streaming", "http_status", "latency_ms", "input_tokens", "output_tokens",
-		"cached_input_tokens", "cache_creation_input_tokens", "attempt_count", "fallback_used", "fallback_reason", "error_message", "request_body", "request_body_truncated", "error_body", "error_body_truncated",
+		"cached_input_tokens", "cache_creation_input_tokens", "attempt_count", "fallback_used", "fallback_reason", "warning_code", "error_message", "request_body", "request_body_truncated", "error_body", "error_body_truncated",
 		"provider_request_id", "client_request_id", "route_kind",
 	})
 	for _, row := range rows {
@@ -347,6 +345,7 @@ func writeActivityCSV(w http.ResponseWriter, r *http.Request, filename string, r
 			strconv.Itoa(row.AttemptCount),
 			strconv.FormatBool(row.FallbackUsed),
 			strPtrOrEmpty(row.FallbackReason),
+			neutralizeCSVField(strPtrOrEmpty(row.WarningCode)),
 			neutralizeCSVField(strPtrOrEmpty(row.ErrorMessage)),
 			neutralizeCSVField(strPtrOrEmpty(row.RequestBody)),
 			strconv.FormatBool(row.RequestBodyTruncated),
@@ -422,7 +421,7 @@ func (s *Server) listRealModelActivity(w http.ResponseWriter, r *http.Request) {
 		adminError(w, 404, "not_found", "Model not found.")
 		return
 	}
-	where, args := realAttribution(provider, upstream)
+	where, args := realAttribution(modelID, provider, upstream)
 	s.listScopedActivity(w, r, where, args, `SELECT count(*) FROM provider_models WHERE id=?`, []any{modelID}, "Model not found.")
 }
 

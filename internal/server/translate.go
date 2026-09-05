@@ -19,7 +19,20 @@ func (u unsupportedFeature) Error() string {
 	return fmt.Sprintf("%s is only supported through a native Responses provider", u.feature)
 }
 
-func translateRequest(body []byte, from, to providers.Protocol, model string) ([]byte, error) {
+// reasoningSelector is a request-local representation of the client's
+// reasoning choice. It is never serialized directly.
+type reasoningSelector struct {
+	Present      bool
+	Enabled      *bool
+	Mode         string
+	Effort       string
+	BudgetTokens *int64
+}
+
+// translateRequest translates a request body from one protocol to another.
+// When the target protocol differs, reasoning controls are extracted before
+// conversion and must be re-applied by the caller via applyReasoningSelector.
+func translateRequest(body []byte, from, to providers.Protocol, model string, modelMaxOutputTokens ...int64) ([]byte, error) {
 	if from == to {
 		return body, nil
 	}
@@ -51,6 +64,9 @@ func translateRequest(body []byte, from, to providers.Protocol, model string) ([
 		return json.Marshal(chat)
 	}
 	if to == providers.ProtocolMessages {
+		if len(modelMaxOutputTokens) > 0 && modelMaxOutputTokens[0] > 0 {
+			chat["max_output_tokens"] = modelMaxOutputTokens[0]
+		}
 		return json.Marshal(chatToMessagesRequest(chat))
 	}
 	if to == providers.ProtocolResponses {
@@ -61,6 +77,495 @@ func translateRequest(body []byte, from, to providers.Protocol, model string) ([
 		return json.Marshal(translated)
 	}
 	return nil, errors.New("unsupported protocol translation")
+}
+
+// extractReasoningSelector extracts a canonical reasoning selector from the
+// incoming request body according to its protocol. Returns a zero-value
+// selector with Present=false when no reasoning control is found.
+func extractReasoningSelector(body []byte, protocol providers.Protocol) reasoningSelector {
+	var source map[string]any
+	if err := json.Unmarshal(body, &source); err != nil {
+		return reasoningSelector{}
+	}
+	switch protocol {
+	case providers.ProtocolChat:
+		return extractChatReasoning(source)
+	case providers.ProtocolResponses:
+		return extractResponsesReasoning(source)
+	case providers.ProtocolMessages:
+		return extractMessagesReasoning(source)
+	}
+	return reasoningSelector{}
+}
+
+// extractChatReasoning extracts reasoning controls from Chat Completions.
+// Determinism: top-level reasoning_effort takes precedence over nested
+// reasoning.effort; nested reasoning.max_tokens maps to budget.
+func extractChatReasoning(source map[string]any) reasoningSelector {
+	sel := reasoningSelector{Present: false}
+	// Top-level reasoning_effort takes precedence.
+	if effort, ok := source["reasoning_effort"].(string); ok && effort != "" {
+		sel.Present = true
+		sel.Effort = effort
+	}
+	// Nested reasoning object: effort, max_tokens, and enable/disable.
+	if reasoning, ok := source["reasoning"].(map[string]any); ok {
+		if effort, ok := reasoning["effort"].(string); ok && effort != "" {
+			sel.Present = true
+			if sel.Effort == "" {
+				sel.Effort = effort
+			}
+		}
+		if maxTokens, ok := coerceInt64(reasoning["max_tokens"]); ok {
+			sel.Present = true
+			sel.BudgetTokens = &maxTokens
+		}
+		// Enable/disable controls.
+		if enabled, ok := reasoning["enabled"].(bool); ok {
+			sel.Present = true
+			sel.Enabled = &enabled
+		}
+	}
+	return sel
+}
+
+// extractResponsesReasoning extracts reasoning controls from Responses.
+// Only reasoning.effort is extracted; reasoning.summary (display) is ignored.
+func extractResponsesReasoning(source map[string]any) reasoningSelector {
+	if reasoning, ok := source["reasoning"].(map[string]any); ok {
+		if effort, ok := reasoning["effort"].(string); ok && effort != "" {
+			return reasoningSelector{Present: true, Effort: effort}
+		}
+	}
+	return reasoningSelector{}
+}
+
+// extractMessagesReasoning extracts reasoning controls from Messages.
+// output_config.effort, thinking.type, and thinking.budget_tokens are
+// extracted; thinking.display is ignored.
+func extractMessagesReasoning(source map[string]any) reasoningSelector {
+	sel := reasoningSelector{Present: false}
+	if outputConfig, ok := source["output_config"].(map[string]any); ok {
+		if effort, ok := outputConfig["effort"].(string); ok && effort != "" {
+			sel.Present = true
+			sel.Effort = effort
+		}
+	}
+	if thinking, ok := source["thinking"].(map[string]any); ok {
+		if t, ok := thinking["type"].(string); ok && t != "" {
+			sel.Present = true
+			sel.Mode = t
+		}
+		if budget, ok := coerceInt64(thinking["budget_tokens"]); ok {
+			sel.Present = true
+			sel.BudgetTokens = &budget
+		}
+	}
+	return sel
+}
+
+// coerceInt64 converts a JSON number to int64. Only float64 (how
+// encoding/json decodes numbers) and int64 are accepted.
+func coerceInt64(v any) (int64, bool) {
+	return providers.CoerceInt64(v)
+}
+
+// applyReasoningSelector maps a canonical selector onto a target request body
+// according to the target protocol and the target model's reasoning
+// capabilities. Unsupported selector parts are silently omitted.
+//
+// Mapping rules:
+//   - Exact effort values map directly when the target advertises them.
+//   - "none" maps to Messages disabled when supported.
+//   - "minimal" maps only when explicitly advertised.
+//   - Numeric budgets map when a numeric target control exists.
+//   - If the target is known not to support reasoning, the selector is omitted.
+//   - If support is unknown, the selector is passed through.
+func applyReasoningSelector(body []byte, selector reasoningSelector, target providers.Protocol, caps *providers.ReasoningCapabilities) []byte {
+	if !selector.Present {
+		return body
+	}
+	opts := providers.ExtractReasoningOptions(caps)
+	unknownSupport := caps == nil
+	// A translated body no longer contains the source protocol's selector. For
+	// known capabilities, start from a clean target body and materialize every
+	// supported part of the canonical selector below. This also keeps native
+	// requests deterministic while preserving non-selector fields.
+	if !unknownSupport {
+		body = stripReasoningSelector(body, target)
+	}
+
+	// If target explicitly doesn't support reasoning, omit the selector.
+	if !unknownSupport && !opts.SupportsEffort && !opts.SupportsBudget && !opts.SupportsToggle && !opts.SupportsAdaptive && !opts.SupportsEnabled {
+		return body
+	}
+
+	mode := selector.Mode
+	if selector.Enabled != nil {
+		if *selector.Enabled {
+			mode = "enabled"
+		} else {
+			mode = "disabled"
+		}
+	}
+	switch target {
+	case providers.ProtocolChat:
+		body = applyChatReasoning(body, selector, mode, opts, caps, unknownSupport)
+	case providers.ProtocolResponses:
+		body = applyResponsesReasoning(body, selector, mode, opts, unknownSupport)
+	case providers.ProtocolMessages:
+		body = applyMessagesReasoning(body, selector, mode, opts, unknownSupport)
+	}
+	return body
+}
+
+// stripReasoningSelector removes recognized reasoning selector fields from a
+// request body so that a target known not to support reasoning receives a
+// clean request. Non-selector fields (e.g. OpenRouter's reasoning.exclude,
+// which controls whether reasoning is returned) are preserved.
+func stripReasoningSelector(body []byte, target providers.Protocol) []byte {
+	var source map[string]any
+	if err := json.Unmarshal(body, &source); err != nil {
+		return body
+	}
+	switch target {
+	case providers.ProtocolChat:
+		delete(source, "reasoning_effort")
+		// Preserve non-selector fields like reasoning.exclude.
+		if reasoning, ok := source["reasoning"].(map[string]any); ok {
+			delete(reasoning, "effort")
+			delete(reasoning, "max_tokens")
+			delete(reasoning, "enabled")
+			delete(reasoning, "mode")
+			if len(reasoning) == 0 {
+				delete(source, "reasoning")
+			}
+		}
+	case providers.ProtocolResponses:
+		if reasoning, ok := source["reasoning"].(map[string]any); ok {
+			delete(reasoning, "effort")
+			delete(reasoning, "enabled")
+			delete(reasoning, "mode")
+			if len(reasoning) == 0 {
+				delete(source, "reasoning")
+			}
+		}
+	case providers.ProtocolMessages:
+		if outputConfig, ok := source["output_config"].(map[string]any); ok {
+			delete(outputConfig, "effort")
+			if len(outputConfig) == 0 {
+				delete(source, "output_config")
+			}
+		}
+		if thinking, ok := source["thinking"].(map[string]any); ok {
+			delete(thinking, "type")
+			delete(thinking, "budget_tokens")
+			if len(thinking) == 0 {
+				delete(source, "thinking")
+			}
+		}
+	}
+	result, _ := json.Marshal(source)
+	return result
+}
+
+// applyChatReasoning maps a selector onto a Chat Completions request.
+// Mode (enabled/disabled) is applied when representable. An explicit disable
+// wins over all other selector parts; when it cannot be represented, the
+// complete contradictory selector is omitted and the provider's default is
+// used.
+func applyChatReasoning(body []byte, selector reasoningSelector, mode string, opts providers.ReasoningOptions, caps *providers.ReasoningCapabilities, unknownSupport bool) []byte {
+	disabled := mode == "disabled" || selector.Effort == "none"
+	if disabled {
+		if opts.SupportsToggle || unknownSupport {
+			return setChatEnabled(body, false)
+		}
+		if effortIsSupported("none", opts) {
+			return setChatEffort(body, "none")
+		}
+		return body
+	}
+	if mode == "enabled" {
+		if opts.SupportsToggle || unknownSupport {
+			body = setChatEnabled(body, true)
+		} else if caps != nil && caps.DefaultEffort != "" && !(caps.Mandatory != nil && *caps.Mandatory && caps.DefaultEffort == "none") && effortIsSupported(caps.DefaultEffort, opts) {
+			body = setChatEffort(body, caps.DefaultEffort)
+		}
+	} else if mode == "adaptive" && unknownSupport {
+		body = setChatMode(body, "adaptive")
+	}
+	if selector.Effort != "" && selector.Effort != "none" && (effortIsSupported(selector.Effort, opts) || unknownSupport) {
+		body = setChatEffort(body, selector.Effort)
+	}
+	if selector.BudgetTokens != nil && (budgetIsSupported(*selector.BudgetTokens, opts) || unknownSupport) {
+		body = setChatBudget(body, *selector.BudgetTokens)
+	}
+	return body
+}
+
+// applyResponsesReasoning maps a selector onto a Responses request.
+func applyResponsesReasoning(body []byte, selector reasoningSelector, mode string, opts providers.ReasoningOptions, unknownSupport bool) []byte {
+	disabled := mode == "disabled" || selector.Effort == "none"
+	if disabled {
+		if opts.SupportsToggle || unknownSupport {
+			return setResponsesEnabled(body, false)
+		}
+		if effortIsSupported("none", opts) {
+			return setResponsesEffort(body, "none")
+		}
+		return body
+	}
+	if mode == "enabled" && (opts.SupportsToggle || unknownSupport) {
+		body = setResponsesEnabled(body, true)
+	} else if mode == "adaptive" && unknownSupport {
+		body = setResponsesMode(body, "adaptive")
+	}
+	if selector.Effort != "" && selector.Effort != "none" && (effortIsSupported(selector.Effort, opts) || unknownSupport) {
+		body = setResponsesEffort(body, selector.Effort)
+	}
+	// Responses has no verified numeric reasoning-budget field. Do not invent
+	// reasoning.max_tokens, even when the source protocol had a token budget.
+	return body
+}
+
+// applyMessagesReasoning maps a selector onto a Messages request.
+// Mode (enabled/disabled/adaptive) is applied when representable. An explicit
+// disable wins over all other selector parts; if it is not representable, the
+// complete contradictory selector is omitted.
+func applyMessagesReasoning(body []byte, selector reasoningSelector, mode string, opts providers.ReasoningOptions, unknownSupport bool) []byte {
+	disabled := mode == "disabled" || selector.Effort == "none"
+	if disabled && (opts.SupportsDisable || unknownSupport) {
+		return setMessagesThinkingType(body, "disabled")
+	}
+	if disabled {
+		return body
+	}
+	switch mode {
+	case "adaptive":
+		if opts.SupportsAdaptive || unknownSupport {
+			body = setMessagesThinkingType(body, "adaptive")
+		}
+	case "enabled":
+		if opts.SupportsAdaptive {
+			body = setMessagesThinkingType(body, "adaptive")
+		} else if opts.SupportsEnabled || opts.SupportsToggle || unknownSupport {
+			body = setMessagesThinkingType(body, "enabled")
+			if selector.BudgetTokens == nil {
+				body = setMessagesBudget(body, messagesDefaultBudget(opts))
+			}
+		}
+	}
+	if selector.Effort != "" && selector.Effort != "none" {
+		if effortIsSupported(selector.Effort, opts) || unknownSupport {
+			body = setMessagesEffort(body, selector.Effort)
+		}
+	}
+	if selector.BudgetTokens != nil && (budgetIsSupported(*selector.BudgetTokens, opts) || unknownSupport) {
+		body = setMessagesBudget(body, *selector.BudgetTokens)
+	}
+	return body
+}
+
+// matchesEffort returns true when the target explicitly advertises the given
+// effort value. "minimal" only matches when explicitly advertised.
+func matchesEffort(effort string, supported []string) bool {
+	for _, s := range supported {
+		if s == effort {
+			return true
+		}
+	}
+	return false
+}
+
+// effortIsSupported distinguishes an explicitly unrestricted effort option
+// (empty values) from a target that has no effort mechanism at all.
+func effortIsSupported(effort string, opts providers.ReasoningOptions) bool {
+	return opts.SupportsEffort && (len(opts.SupportedEfforts) == 0 || matchesEffort(effort, opts.SupportedEfforts))
+}
+
+func budgetIsSupported(budget int64, opts providers.ReasoningOptions) bool {
+	if !opts.SupportsBudget {
+		return false
+	}
+	if opts.BudgetMin != nil && budget < *opts.BudgetMin {
+		return false
+	}
+	if opts.BudgetMax != nil && budget > *opts.BudgetMax {
+		return false
+	}
+	return true
+}
+
+// setChatEffort sets reasoning_effort on a Chat Completions body.
+func setChatEffort(body []byte, effort string) []byte {
+	var source map[string]any
+	if err := json.Unmarshal(body, &source); err != nil {
+		return body
+	}
+	source["reasoning_effort"] = effort
+	result, _ := json.Marshal(source)
+	return result
+}
+
+func setChatEnabled(body []byte, enabled bool) []byte {
+	var source map[string]any
+	if err := json.Unmarshal(body, &source); err != nil {
+		return body
+	}
+	reasoning, _ := source["reasoning"].(map[string]any)
+	if reasoning == nil {
+		reasoning = map[string]any{}
+	}
+	reasoning["enabled"] = enabled
+	source["reasoning"] = reasoning
+	result, _ := json.Marshal(source)
+	return result
+}
+
+func setChatMode(body []byte, mode string) []byte {
+	var source map[string]any
+	if err := json.Unmarshal(body, &source); err != nil {
+		return body
+	}
+	reasoning, _ := source["reasoning"].(map[string]any)
+	if reasoning == nil {
+		reasoning = map[string]any{}
+	}
+	reasoning["mode"] = mode
+	source["reasoning"] = reasoning
+	result, _ := json.Marshal(source)
+	return result
+}
+
+// setChatBudget sets reasoning.max_tokens on a Chat Completions body.
+const maxJavaScriptSafeInteger = int64(1<<53 - 1)
+
+func setChatBudget(body []byte, budget int64) []byte {
+	var source map[string]any
+	if err := json.Unmarshal(body, &source); err != nil {
+		return body
+	}
+	reasoning, _ := source["reasoning"].(map[string]any)
+	if reasoning == nil {
+		reasoning = map[string]any{}
+	}
+	if budget > maxJavaScriptSafeInteger {
+		reasoning["max_tokens"] = fmt.Sprint(budget)
+	} else {
+		reasoning["max_tokens"] = budget
+	}
+	source["reasoning"] = reasoning
+	result, _ := json.Marshal(source)
+	return result
+}
+
+// setResponsesEffort sets reasoning.effort on a Responses body.
+func setResponsesEffort(body []byte, effort string) []byte {
+	var source map[string]any
+	if err := json.Unmarshal(body, &source); err != nil {
+		return body
+	}
+	reasoning, _ := source["reasoning"].(map[string]any)
+	if reasoning == nil {
+		reasoning = map[string]any{}
+	}
+	reasoning["effort"] = effort
+	source["reasoning"] = reasoning
+	result, _ := json.Marshal(source)
+	return result
+}
+
+func setResponsesEnabled(body []byte, enabled bool) []byte {
+	var source map[string]any
+	if err := json.Unmarshal(body, &source); err != nil {
+		return body
+	}
+	reasoning, _ := source["reasoning"].(map[string]any)
+	if reasoning == nil {
+		reasoning = map[string]any{}
+	}
+	reasoning["enabled"] = enabled
+	source["reasoning"] = reasoning
+	result, _ := json.Marshal(source)
+	return result
+}
+
+func setResponsesMode(body []byte, mode string) []byte {
+	var source map[string]any
+	if err := json.Unmarshal(body, &source); err != nil {
+		return body
+	}
+	reasoning, _ := source["reasoning"].(map[string]any)
+	if reasoning == nil {
+		reasoning = map[string]any{}
+	}
+	reasoning["mode"] = mode
+	source["reasoning"] = reasoning
+	result, _ := json.Marshal(source)
+	return result
+}
+
+// setMessagesEffort sets output_config.effort on a Messages body.
+func setMessagesEffort(body []byte, effort string) []byte {
+	var source map[string]any
+	if err := json.Unmarshal(body, &source); err != nil {
+		return body
+	}
+	outputConfig, _ := source["output_config"].(map[string]any)
+	if outputConfig == nil {
+		outputConfig = map[string]any{}
+	}
+	outputConfig["effort"] = effort
+	source["output_config"] = outputConfig
+	result, _ := json.Marshal(source)
+	return result
+}
+
+// setMessagesDisabled sets thinking.type = disabled on a Messages body.
+func setMessagesDisabled(body []byte) []byte {
+	return setMessagesThinkingType(body, "disabled")
+}
+
+func setMessagesThinkingType(body []byte, thinkingType string) []byte {
+	var source map[string]any
+	if err := json.Unmarshal(body, &source); err != nil {
+		return body
+	}
+	thinking, _ := source["thinking"].(map[string]any)
+	if thinking == nil {
+		thinking = map[string]any{}
+	}
+	thinking["type"] = thinkingType
+	source["thinking"] = thinking
+	result, _ := json.Marshal(source)
+	return result
+}
+
+// setMessagesBudget sets thinking.budget_tokens on a Messages body.
+func setMessagesBudget(body []byte, budget int64) []byte {
+	var source map[string]any
+	if err := json.Unmarshal(body, &source); err != nil {
+		return body
+	}
+	thinking, _ := source["thinking"].(map[string]any)
+	if thinking == nil {
+		thinking = map[string]any{}
+	}
+	thinking["budget_tokens"] = budget
+	source["thinking"] = thinking
+	result, _ := json.Marshal(source)
+	return result
+}
+
+// messagesDefaultBudget returns a safe budget_tokens value for a target that
+// only supports thinking.type: "enabled" (where budget_tokens is required).
+// It prefers the target's advertised minimum; if unknown, it falls back to
+// Anthropic's documented floor of 1024.
+func messagesDefaultBudget(opts providers.ReasoningOptions) int64 {
+	if opts.BudgetMin != nil {
+		return *opts.BudgetMin
+	}
+	return 1024
 }
 
 func requestToChat(source map[string]any, from providers.Protocol) (map[string]any, error) {
@@ -172,7 +677,11 @@ func requestToChat(source map[string]any, from providers.Protocol) (map[string]a
 }
 
 func chatToMessagesRequest(chat map[string]any) map[string]any {
-	out := map[string]any{"model": chat["model"], "max_tokens": 4096}
+	maxTokens := any(4096)
+	if max, ok := chat["max_output_tokens"]; ok {
+		maxTokens = max
+	}
+	out := map[string]any{"model": chat["model"], "max_tokens": maxTokens}
 	for _, key := range []string{"temperature", "top_p", "stream", "stop_sequences", "metadata"} {
 		if v, ok := chat[key]; ok {
 			out[key] = v
@@ -328,7 +837,7 @@ func chatToResponsesRequest(chat map[string]any) (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		if choice == suppressToolChoice {
+		if choice == actionSuppressTools {
 			suppressTools = true
 		} else if choice != "" {
 			out["tool_choice"] = choice
@@ -413,18 +922,26 @@ func responseToChat(source map[string]any, target providers.Protocol, model stri
 	usage := source["usage"]
 	if target == providers.ProtocolMessages {
 		content := []any{}
+		var reasoningText string
 		for _, raw := range asSlice(source["content"]) {
 			block, _ := raw.(map[string]any)
 			switch block["type"] {
-			case "text", "thinking":
+			case "text":
 				if text, _ := block["text"].(string); text != "" {
 					content = append(content, map[string]any{"type": "text", "text": text})
+				}
+			case "thinking":
+				if text, _ := block["thinking"].(string); text != "" {
+					reasoningText += text
 				}
 			case "tool_use":
 				calls, _ := message["tool_calls"].([]any)
 				calls = append(calls, map[string]any{"id": block["id"], "type": "function", "function": map[string]any{"name": block["name"], "arguments": jsonString(block["input"])}})
 				message["tool_calls"] = calls
 			}
+		}
+		if reasoningText != "" {
+			message["reasoning_content"] = reasoningText
 		}
 		message["content"] = content
 		if source["stop_reason"] == "tool_use" {
@@ -436,19 +953,32 @@ func responseToChat(source map[string]any, target providers.Protocol, model stri
 	} else {
 		content := []any{}
 		calls := []any{}
+		var reasoningText string
 		for _, raw := range asSlice(source["output"]) {
 			item, _ := raw.(map[string]any)
 			switch item["type"] {
 			case "message":
 				for _, partRaw := range asSlice(item["content"]) {
 					part, _ := partRaw.(map[string]any)
-					if part["type"] == "output_text" {
+					switch part["type"] {
+					case "output_text":
 						content = append(content, map[string]any{"type": "text", "text": part["text"]})
+					case "reasoning":
+						reasoningText += fmt.Sprint(part["text"])
+					}
+				}
+			case "reasoning":
+				for _, summaryRaw := range asSlice(item["summary"]) {
+					if summary, ok := summaryRaw.(map[string]any); ok {
+						reasoningText += fmt.Sprint(summary["text"])
 					}
 				}
 			case "function_call":
 				calls = append(calls, map[string]any{"id": item["call_id"], "type": "function", "function": map[string]any{"name": item["name"], "arguments": item["arguments"]}})
 			}
+		}
+		if reasoningText != "" {
+			message["reasoning_content"] = reasoningText
 		}
 		message["content"] = content
 		if len(calls) > 0 {
@@ -474,6 +1004,9 @@ func chatResponseToMessages(chat map[string]any, model string) map[string]any {
 		call, _ := raw.(map[string]any)
 		fn, _ := call["function"].(map[string]any)
 		content = append(content, map[string]any{"type": "tool_use", "id": call["id"], "name": fn["name"], "input": jsonValue(fn["arguments"])})
+	}
+	if reasoning, ok := message["reasoning_content"].(string); ok && reasoning != "" {
+		content = append([]any{map[string]any{"type": "thinking", "thinking": reasoning}}, content...)
 	}
 	stop := "end_turn"
 	if choice["finish_reason"] == "tool_calls" {
@@ -502,6 +1035,9 @@ func chatResponseToResponses(chat map[string]any, model string) map[string]any {
 		}
 	}
 	output = append(output, map[string]any{"id": "msg_" + fmt.Sprint(chat["id"]), "type": "message", "role": "assistant", "status": "completed", "content": parts})
+	if reasoning, ok := message["reasoning_content"].(string); ok && reasoning != "" {
+		output = append(output, map[string]any{"id": "rs_" + fmt.Sprint(chat["id"]), "type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": reasoning}}})
+	}
 	for _, raw := range asSlice(message["tool_calls"]) {
 		call, _ := raw.(map[string]any)
 		fn, _ := call["function"].(map[string]any)
@@ -518,7 +1054,8 @@ func translateSSE(w http.ResponseWriter, reader *bufio.Reader, incoming, target 
 	flusher, _ := w.(http.Flusher)
 	state := &streamState{id: "tiller_" + fmt.Sprint(time.Now().UnixNano()), model: model}
 	for {
-		event, data, err := readSSEEvent(reader)
+		event, err := readSSEEvent(reader)
+		data := event.Data
 		if string(data) == "[DONE]" {
 			writeStreamDone(w, incoming, state)
 			if flusher != nil {
@@ -530,7 +1067,7 @@ func translateSSE(w http.ResponseWriter, reader *bufio.Reader, incoming, target 
 			var payload map[string]any
 			if json.Unmarshal(data, &payload) == nil {
 				captureStreamUsage(payload, target, usage)
-				deltas, done := canonicalDeltas(event, payload, target, state)
+				deltas, done := canonicalDeltas(event.Name, payload, target, state)
 				for _, delta := range deltas {
 					writeTranslatedEvent(w, incoming, state, delta)
 					if flusher != nil {
@@ -556,15 +1093,30 @@ func translateSSE(w http.ResponseWriter, reader *bufio.Reader, incoming, target 
 	}
 }
 
+const maxAccumulatedTextBytes = 8 * 1024 * 1024
+
 type streamState struct {
-	id, model                     string
-	started, contentStarted, done bool
-	outputIndex                   int
-	accumulated                   strings.Builder
+	id, model                                       string
+	started, contentStarted, reasoningStarted, done bool
+	outputIndex                                     int
+	accumulated                                     strings.Builder
+	accumulatedBytes                                int
+	toolStarted                                     bool
+	inputTokens                                     int64
+	outputTokens                                    int64
+	hasInputTokens                                  bool
+	hasOutputTokens                                 bool
 }
 type canonicalDelta struct {
 	Kind, Text, CallID, Name, Arguments, Finish string
 	Usage                                       any
+}
+
+type sseEvent struct {
+	Name  string
+	Data  []byte
+	ID    string
+	Retry *int
 }
 
 func canonicalDeltas(event string, payload map[string]any, target providers.Protocol, state *streamState) ([]canonicalDelta, bool) {
@@ -578,6 +1130,11 @@ func canonicalDeltas(event string, payload map[string]any, target providers.Prot
 			delta, _ := choice["delta"].(map[string]any)
 			if text, ok := delta["content"].(string); ok && text != "" {
 				out = append(out, canonicalDelta{Kind: "text", Text: text})
+			}
+			if text, ok := delta["reasoning_content"].(string); ok && text != "" {
+				out = append(out, canonicalDelta{Kind: "reasoning", Text: text})
+			} else if text, ok := delta["reasoning"].(string); ok && text != "" {
+				out = append(out, canonicalDelta{Kind: "reasoning", Text: text})
 			}
 			for _, callRaw := range asSlice(delta["tool_calls"]) {
 				call, _ := callRaw.(map[string]any)
@@ -600,6 +1157,9 @@ func canonicalDeltas(event string, payload map[string]any, target providers.Prot
 				if id, ok := message["id"].(string); ok {
 					state.id = id
 				}
+				if u, ok := message["usage"].(map[string]any); ok {
+					out = append(out, canonicalDelta{Kind: "usage", Usage: map[string]any{"input_tokens": u["input_tokens"]}})
+				}
 			}
 		case "content_block_start":
 			if block, ok := payload["content_block"].(map[string]any); ok && block["type"] == "tool_use" {
@@ -610,11 +1170,17 @@ func canonicalDeltas(event string, payload map[string]any, target providers.Prot
 				if text, ok := delta["text"].(string); ok {
 					out = append(out, canonicalDelta{Kind: "text", Text: text})
 				}
+				if thinking, ok := delta["thinking"].(string); ok && thinking != "" {
+					out = append(out, canonicalDelta{Kind: "reasoning", Text: thinking})
+				}
 				if partial, ok := delta["partial_json"].(string); ok {
 					out = append(out, canonicalDelta{Kind: "tool", Arguments: partial})
 				}
 			}
 		case "message_delta":
+			if u, ok := payload["usage"].(map[string]any); ok {
+				out = append(out, canonicalDelta{Kind: "usage", Usage: map[string]any{"output_tokens": u["output_tokens"]}})
+			}
 			if delta, ok := payload["delta"].(map[string]any); ok {
 				out = append(out, canonicalDelta{Kind: "finish", Finish: fmt.Sprint(delta["stop_reason"])})
 			}
@@ -633,6 +1199,8 @@ func canonicalDeltas(event string, payload map[string]any, target providers.Prot
 		}
 	case "response.output_text.delta":
 		out = append(out, canonicalDelta{Kind: "text", Text: fmt.Sprint(payload["delta"])})
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		out = append(out, canonicalDelta{Kind: "reasoning", Text: fmt.Sprint(payload["delta"])})
 	case "response.function_call_arguments.delta":
 		out = append(out, canonicalDelta{Kind: "tool", CallID: fmt.Sprint(payload["call_id"]), Arguments: fmt.Sprint(payload["delta"])})
 	case "response.output_item.added":
@@ -640,6 +1208,14 @@ func canonicalDeltas(event string, payload map[string]any, target providers.Prot
 			out = append(out, canonicalDelta{Kind: "tool", CallID: fmt.Sprint(item["call_id"]), Name: fmt.Sprint(item["name"])})
 		}
 	case "response.completed":
+		if response, ok := payload["response"].(map[string]any); ok {
+			if u, ok := response["usage"].(map[string]any); ok {
+				out = append(out, canonicalDelta{Kind: "usage", Usage: u})
+			}
+		}
+		// Responses has no separate finish event. Emit one so translated
+		// Chat and Messages streams can close their assistant message cleanly.
+		out = append(out, canonicalDelta{Kind: "finish", Finish: "stop"})
 		return out, true
 	}
 	return out, false
@@ -657,6 +1233,8 @@ func writeTranslatedEvent(w io.Writer, incoming providers.Protocol, state *strea
 		switch delta.Kind {
 		case "text":
 			d["content"] = delta.Text
+		case "reasoning":
+			d["reasoning_content"] = delta.Text
 		case "tool":
 			d["tool_calls"] = []any{map[string]any{"index": 0, "id": emptyNil(delta.CallID), "type": "function", "function": map[string]any{"name": emptyNil(delta.Name), "arguments": delta.Arguments}}}
 		case "finish":
@@ -665,7 +1243,7 @@ func writeTranslatedEvent(w io.Writer, incoming providers.Protocol, state *strea
 		payload["choices"] = []any{choice}
 		if delta.Kind == "usage" {
 			payload["choices"] = []any{}
-			payload["usage"] = delta.Usage
+			payload["usage"] = chatUsage(delta.Usage)
 		}
 		writeSSE(w, "", payload)
 		return
@@ -682,11 +1260,38 @@ func writeTranslatedEvent(w io.Writer, incoming providers.Protocol, state *strea
 				state.contentStarted = true
 			}
 			writeSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": delta.Text}})
+		case "reasoning":
+			if !state.reasoningStarted {
+				writeSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 1, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
+				state.reasoningStarted = true
+			}
+			writeSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 1, "delta": map[string]any{"type": "thinking_delta", "thinking": delta.Text}})
+		case "usage":
+			if u, ok := delta.Usage.(map[string]any); ok {
+				if value, ok := coerceInt64(u["input_tokens"]); ok && !state.hasInputTokens {
+					state.inputTokens = value
+					state.hasInputTokens = true
+				}
+				if value, ok := coerceInt64(u["output_tokens"]); ok && !state.hasOutputTokens {
+					state.outputTokens = value
+					state.hasOutputTokens = true
+				}
+			}
 		case "finish":
+			if state.reasoningStarted {
+				writeSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 1})
+			}
 			if state.contentStarted {
 				writeSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
 			}
-			writeSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": normalizeAnthropicFinish(delta.Finish), "stop_sequence": nil}, "usage": map[string]any{"output_tokens": 0}})
+			usage := map[string]any{"input_tokens": 0, "output_tokens": 0}
+			if state.hasInputTokens {
+				usage["input_tokens"] = state.inputTokens
+			}
+			if state.hasOutputTokens {
+				usage["output_tokens"] = state.outputTokens
+			}
+			writeSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": normalizeAnthropicFinish(delta.Finish), "stop_sequence": nil}, "usage": usage})
 		}
 		return
 	}
@@ -697,10 +1302,51 @@ func writeTranslatedEvent(w io.Writer, incoming providers.Protocol, state *strea
 		writeSSE(w, "response.content_part.added", map[string]any{"type": "response.content_part.added", "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}})
 		state.started = true
 	}
-	if delta.Kind == "text" {
-		state.accumulated.WriteString(delta.Text)
+	switch delta.Kind {
+	case "text":
+		if remaining := maxAccumulatedTextBytes - state.accumulatedBytes; remaining > 0 {
+			text := delta.Text
+			if len(text) > remaining {
+				text = text[:remaining]
+			}
+			state.accumulated.WriteString(text)
+			state.accumulatedBytes += len(text)
+		}
 		writeSSE(w, "response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": delta.Text})
+	case "reasoning":
+		writeSSE(w, "response.reasoning_summary_text.delta", map[string]any{"type": "response.reasoning_summary_text.delta", "output_index": 0, "summary_index": 0, "delta": delta.Text})
+	case "tool":
+		if !state.toolStarted {
+			writeSSE(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 1, "item": map[string]any{"type": "function_call", "call_id": delta.CallID, "name": delta.Name, "arguments": ""}})
+			state.toolStarted = true
+		}
+		if delta.Arguments != "" {
+			writeSSE(w, "response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": 1, "item_id": delta.CallID, "call_id": delta.CallID, "delta": delta.Arguments})
+		}
 	}
+}
+
+func chatUsage(value any) any {
+	u, ok := value.(map[string]any)
+	if !ok {
+		return value
+	}
+	if _, hasPrompt := u["prompt_tokens"]; hasPrompt {
+		return u
+	}
+	converted := map[string]any{}
+	for key, value := range u {
+		converted[key] = value
+	}
+	if input, ok := converted["input_tokens"]; ok {
+		converted["prompt_tokens"] = input
+		delete(converted, "input_tokens")
+	}
+	if output, ok := converted["output_tokens"]; ok {
+		converted["completion_tokens"] = output
+		delete(converted, "output_tokens")
+	}
+	return converted
 }
 
 func writeStreamDone(w io.Writer, incoming providers.Protocol, state *streamState) {
@@ -726,25 +1372,36 @@ func writeStreamDone(w io.Writer, incoming providers.Protocol, state *streamStat
 	writeSSE(w, "response.completed", map[string]any{"type": "response.completed", "response": response})
 }
 
-func readSSEEvent(r *bufio.Reader) (string, []byte, error) {
-	var event string
-	var data []byte
+func readSSEEvent(r *bufio.Reader) (sseEvent, error) {
+	var event sseEvent
 	for {
 		line, err := r.ReadString('\n')
 		trim := strings.TrimRight(line, "\r\n")
-		if strings.HasPrefix(trim, "event:") {
-			event = strings.TrimSpace(strings.TrimPrefix(trim, "event:"))
-		} else if strings.HasPrefix(trim, "data:") {
-			if len(data) > 0 {
-				data = append(data, '\n')
-			}
-			data = append(data, strings.TrimSpace(strings.TrimPrefix(trim, "data:"))...)
+		field, value, hasField := strings.Cut(trim, ":")
+		if hasField {
+			value = strings.TrimPrefix(value, " ")
 		}
-		if trim == "" && len(data) > 0 {
-			return event, data, nil
+		switch field {
+		case "event":
+			event.Name = value
+		case "data":
+			if len(event.Data) > 0 {
+				event.Data = append(event.Data, '\n')
+			}
+			event.Data = append(event.Data, value...)
+		case "id":
+			event.ID = value
+		case "retry":
+			var retry int
+			if _, scanErr := fmt.Sscanf(value, "%d", &retry); scanErr == nil && retry >= 0 {
+				event.Retry = &retry
+			}
+		}
+		if trim == "" && (len(event.Data) > 0 || event.Name != "" || event.ID != "" || event.Retry != nil) {
+			return event, nil
 		}
 		if err != nil {
-			return event, data, err
+			return event, err
 		}
 	}
 }
@@ -842,10 +1499,9 @@ func chatContentToResponsesParts(value any) ([]any, error) {
 	return parts, nil
 }
 
-// suppressToolChoice is a sentinel returned by convertToolChoice to signal
-// that the caller should omit both tool_choice and tools from the relay
-// request (the Chat "none" semantics: do not call tools).
-const suppressToolChoice = "__suppress_tools__"
+type toolChoiceAction int
+
+const actionSuppressTools toolChoiceAction = iota + 1
 
 func convertToolChoice(value any) (any, error) {
 	// The Responses wire shape used by chat-completions translation only
@@ -861,7 +1517,7 @@ func convertToolChoice(value any) (any, error) {
 	case "auto":
 		return v, nil
 	case "none":
-		return suppressToolChoice, nil
+		return actionSuppressTools, nil
 	default:
 		return nil, unsupportedFeature{"tool_choice " + v}
 	}

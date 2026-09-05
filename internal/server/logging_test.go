@@ -444,20 +444,28 @@ func TestProviderErrorMessageAndBodyArePassedThroughToClientButNotLogged(t *test
 		t.Fatalf("provider error was persisted in activity: status=%d payload=%v", status, activity)
 	}
 	activityRow := activity["data"].([]any)[0].(map[string]any)
-	if activityRow["error_text"] != "upstream_error" || activityRow["error_message"] != nil {
+	if activityRow["error_text"] != "upstream_error" {
 		t.Fatalf("provider error metadata = %v", activityRow)
+	}
+	// error_message should be a human-readable translation, not nil.
+	if msg, ok := activityRow["error_message"].(string); !ok || msg == "" {
+		t.Fatalf("expected human-readable error_message, got %v", activityRow)
 	}
 	status, attempts, _ := api.request("GET", "/api/admin/activity/"+reqID+"/attempts", nil)
 	if status != http.StatusOK || strings.Contains(string(mustJSON(t, attempts)), marker) {
 		t.Fatalf("provider error was persisted in attempts: status=%d payload=%v", status, attempts)
 	}
 	attemptRow := attempts["data"].([]any)[0].(map[string]any)
-	if attemptRow["failure_class"] != "http_502" || attemptRow["error_message"] != nil {
+	if attemptRow["failure_class"] != "http_502" {
 		t.Fatalf("provider attempt metadata = %v", attemptRow)
+	}
+	// Attempt error_message should be a human-readable translation.
+	if msg, ok := attemptRow["error_message"].(string); !ok || msg == "" {
+		t.Fatalf("expected human-readable attempt error_message, got %v", attemptRow)
 	}
 }
 
-func TestDetailedErrorLoggingCapturesBodies(t *testing.T) {
+func TestRequestLoggingDoesNotCaptureBodies(t *testing.T) {
 	const requestMarker = "CLIENT-REQUEST-SECRET-MARKER"
 	const errorMarker = "PROVIDER-ERROR-SECRET-MARKER"
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -469,23 +477,19 @@ func TestDetailedErrorLoggingCapturesBodies(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": errorMarker}})
 	})
 	api, db, clientID, secret := loggingTestHarness(t, upstream)
-	status, _, _ := api.request("PUT", "/api/admin/settings", map[string]any{"log_error_bodies": true})
-	if status != 204 {
-		t.Fatalf("enable detailed error logging: %d", status)
-	}
 	resp, _ := clientCall(t, api.base, secret, "/v1/chat/completions", map[string]any{"model": "provider-a/model-a", "messages": []any{map[string]any{"role": "user", "content": requestMarker}}})
 	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("provider error status = %d", resp.StatusCode)
 	}
-	var requestBody, errorBody string
+	var requestBody, errorBody *string
 	var requestTruncated, errorTruncated int
 	if err := db.SQL.QueryRow(`SELECT request_body,error_body,request_body_truncated,error_body_truncated FROM request_logs WHERE client_key_id=?`, clientID).Scan(&requestBody, &errorBody, &requestTruncated, &errorTruncated); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(requestBody, requestMarker) || !strings.Contains(errorBody, errorMarker) || requestTruncated != 0 || errorTruncated != 0 {
-		t.Fatalf("captured bodies wrong: request=%q error=%q truncated=%d/%d", requestBody, errorBody, requestTruncated, errorTruncated)
+	if requestBody != nil || errorBody != nil || requestTruncated != 0 || errorTruncated != 0 {
+		t.Fatalf("request or provider bodies were persisted: request=%v error=%v truncated=%d/%d", requestBody, errorBody, requestTruncated, errorTruncated)
 	}
 }
 
