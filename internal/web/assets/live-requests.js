@@ -1,8 +1,17 @@
 // Request-level live view. No completed-history seed or browser persistence.
 // The graph retains its separate aggregate feed.
 export class LiveRequests {
-  constructor(root, { api, h, date, when, requestIdentity, rowCache }) {
-    Object.assign(this, { root, api, h, date, when, requestIdentity, rowCache });
+  constructor(root, { api, h, date, when, requestIdentity, rowCache, errorClassSummary, errorRouteLabel, activityErrorBox, removeErrorDetails }) {
+    // The error-box helpers live in app.js (which owns the #error-dialog
+    // payload store) and are injected; a bare module instance falls back to
+    // the raw failure class so it can never throw on a missing renderer.
+    Object.assign(this, {
+      root, api, h, date, when, requestIdentity, rowCache,
+      errorClassSummary: errorClassSummary || (cls => cls || 'Request failed'),
+      errorRouteLabel: errorRouteLabel || ((provider, model, fallback) => (provider ? (model ? `${provider}/${model}` : provider) : (fallback || 'router'))),
+      activityErrorBox: activityErrorBox || null,
+      removeErrorDetails,
+    });
     this.rows = new Map();
     this.expanded = new Set();
     this.omitted = new Map();
@@ -57,8 +66,12 @@ export class LiveRequests {
     this.omitted.clear();
     this.seen.clear();
     this.reconciling = false;
-    for (const node of [...this.root.querySelector('#live-requests-body').tBodies]) node.remove();
-    this.root.querySelector('#mobile-activity-body').replaceChildren();
+    const table = this.root.querySelector('#live-requests-body');
+    const cards = this.root.querySelector('#mobile-activity-body');
+    this.removeErrorDetails?.(table);
+    this.removeErrorDetails?.(cards);
+    for (const node of [...table.tBodies]) node.remove();
+    cards.replaceChildren();
   }
 
   setConnection(state) {
@@ -171,6 +184,22 @@ export class LiveRequests {
     return `<button type="button" class="btn btn-small btn-secondary live-fallback" data-live-fallback="${this.h(row.id)}" aria-expanded="${expanded}">Fallback ${expanded ? '▴' : '▾'}</button>`;
   }
 
+  // Failures render as the same red error box as Activity: model name + status,
+  // one line of what went wrong, full detail on click (#error-dialog). A live
+  // row carries no attempt-error body, so the dialog is built from the row.
+  targetErrorHTML(row, route) {
+    if (!row.error_text) return '';
+    if (!this.activityErrorBox) return '';
+    const summary = this.errorClassSummary(row.error_text);
+    const status = row.http_status ? `HTTP ${row.http_status}` : 'failed';
+    const hover = [row.error_text, row.error_message, row.latency_ms ? `Latency: ${row.latency_ms} ms` : ''].filter(Boolean).join(' · ');
+    const parts = [`Error: ${row.error_text}${row.error_message ? ` — ${row.error_message}` : ''}`];
+    if (row.http_status) parts.push(`HTTP status: ${row.http_status}`);
+    if (row.latency_ms) parts.push(`Latency: ${row.latency_ms} ms`);
+    if (row.client_request_id) parts.push(`Request ID: ${row.client_request_id}`);
+    return `<div class="attempt-sequence">${this.activityErrorBox({ route, status, summary, hover, detail: { title: `${route} · ${status}`, body: parts.join('\n\n') } })}</div>`;
+  }
+
   targetHTML(row) {
     const last = row.attempts?.at(-1);
     const provider = row.resolved_provider || last?.provider;
@@ -178,7 +207,7 @@ export class LiveRequests {
     const route = provider ? `${provider}/${model || ''}` : row.completed_at ? 'Unresolved' : 'Resolving…';
     const cls = row.state === 'success' ? 'attempt-success' : row.state === 'failed' ? 'attempt-failed' : 'attempt-neutral';
     const status = row.completed_at ? (row.http_status ? `HTTP ${row.http_status}` : row.state) : row.state === 'streaming' ? 'Streaming' : 'Running';
-    return `<div class="live-model-target"><div class="activity-attempt live-model-box ${cls}"><span class="attempt-route"><code class="model-id" title="${this.h(route)}">${this.h(route)}</code></span><span class="attempt-status">${this.h(status)}</span></div>${this.fallbackHTML(row)}</div>${row.error_text ? `<span class="error-text live-model-error">${this.h(row.error_text)}</span>` : ''}`;
+    return `<div class="live-model-target"><div class="activity-attempt live-model-box ${cls}"><span class="attempt-route"><code class="model-id" title="${this.h(route)}">${this.h(route)}</code></span><span class="attempt-status">${this.h(status)}</span></div>${this.fallbackHTML(row)}</div>${this.targetErrorHTML(row, this.errorRouteLabel(provider, model, row.requested_model))}`;
   }
 
   chainHTML(row) {
@@ -218,7 +247,11 @@ export class LiveRequests {
     const before = new Map(mounted.map(node => [node, node.getBoundingClientRect().top]));
     const keep = new Set(rows.map(row => row.id));
     for (const container of [table, cards]) {
-      for (const node of [...container.children]) if (node.dataset.liveRequest && !keep.has(node.dataset.liveRequest)) node.remove();
+      for (const node of [...container.children]) {
+        if (!node.dataset.liveRequest || keep.has(node.dataset.liveRequest)) continue;
+        this.removeErrorDetails?.(node);
+        node.remove();
+      }
     }
     const groupsByID = new Map([...table.tBodies].map(node => [node.dataset.liveRequest, node]));
     const cardsByID = new Map([...cards.children].map(node => [node.dataset.liveRequest, node]));
@@ -239,6 +272,7 @@ export class LiveRequests {
       const groupNew = !group;
       if (groupNew) { group = document.createElement('tbody'); group.dataset.liveRequest = row.id; }
       if (group.dataset.renderKey !== key) {
+        this.removeErrorDetails?.(group);
         group.dataset.renderKey = key;
         group.innerHTML = `<tr><td>${this.ageHTML(row)}</td><td><strong class="client-name">${this.h(row.client_name)}</strong></td><td>${this.requestIdentity(row)}</td><td>${this.targetHTML(row)}</td><td>${this.elapsedHTML(row)}</td><td>${this.rowCache(row)}</td></tr>${this.expanded.has(row.id) ? `<tr class="live-chain-row"><td colspan="6">${this.chainHTML(row)}</td></tr>` : ''}`;
       }
@@ -249,6 +283,7 @@ export class LiveRequests {
       const cardNew = !card;
       if (cardNew) { card = document.createElement('article'); card.className = 'live-activity-card'; card.dataset.liveRequest = row.id; }
       if (card.dataset.renderKey !== key) {
+        this.removeErrorDetails?.(card);
         card.dataset.renderKey = key;
         card.innerHTML = `<div class="live-activity-top"><strong>${this.h(row.client_name)}</strong><div class="live-request-mobile-route">${this.requestIdentity(row)}<span aria-hidden="true"> → </span>${this.targetHTML(row)}</div></div>${this.chainHTML(row)}`;
       }

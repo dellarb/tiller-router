@@ -62,8 +62,13 @@ type ActivityRow struct {
 	ClientRequestID          string
 	ErrorText                *string
 	ErrorMessage             *string
+	HasRequestBody           bool
+	HasResponseBody          bool
+	HasErrorBody             bool
 	RequestBody              *string
 	RequestBodyTruncated     bool
+	ResponseBody             *string
+	ResponseBodyTruncated    bool
 	ErrorBody                *string
 	ErrorBodyTruncated       bool
 	AttemptCount             int
@@ -91,16 +96,52 @@ type RequestAttemptRow struct {
 	CreatedAt          string
 }
 
-const activityColumns = `rl.id,rl.requested_model,rl.exposed_model,rl.route_kind,rl.route_model_id,rl.route_model,rl.resolved_provider,rl.resolved_model,rl.protocol,rl.streaming,rl.http_status,rl.latency_ms,rl.input_tokens,rl.output_tokens,rl.cache_read_input_tokens,rl.cache_creation_input_tokens,rl.provider_request_id,rl.client_request_id,rl.error_text,rl.error_message,rl.request_body,rl.request_body_truncated,rl.error_body,rl.error_body_truncated,rl.attempt_count,(SELECT COUNT(*) FROM request_attempts ra WHERE ra.request_log_id=rl.id AND ra.account_id=rl.account_id),rl.fallback_used,rl.fallback_reason,rl.created_at,rl.estimated_cost_micros,rl.provider_cost_micros,rl.input_tokens_source,rl.output_tokens_source,rl.reasoning_stripped`
+const activityColumns = `rl.id,rl.requested_model,rl.exposed_model,rl.route_kind,rl.route_model_id,rl.route_model,rl.resolved_provider,rl.resolved_model,rl.protocol,rl.streaming,rl.http_status,rl.latency_ms,rl.input_tokens,rl.output_tokens,rl.cache_read_input_tokens,rl.cache_creation_input_tokens,rl.provider_request_id,rl.client_request_id,rl.error_text,rl.error_message,rl.request_body,rl.request_body_truncated,rl.response_body,rl.response_body_truncated,rl.error_body,rl.error_body_truncated,rl.attempt_count,(SELECT COUNT(*) FROM request_attempts ra WHERE ra.request_log_id=rl.id AND ra.account_id=rl.account_id),rl.fallback_used,rl.fallback_reason,rl.created_at,rl.estimated_cost_micros,rl.provider_cost_micros,rl.input_tokens_source,rl.output_tokens_source,rl.reasoning_stripped`
 
-func (s *Scope) scanActivityRows(rows *sql.Rows, withClientKey, withClientName bool) ([]ActivityRow, error) {
+var activityMetadataColumns = strings.NewReplacer(
+	"rl.request_body,", "NULL,",
+	"rl.response_body,", "NULL,",
+	"rl.error_body,", "NULL,",
+).Replace(activityColumns)
+
+var activityListColumns = activityMetadataColumns + `,rl.request_body IS NOT NULL,rl.response_body IS NOT NULL,rl.error_body IS NOT NULL`
+
+// ActivityBodies is the captured message bodies of one request.
+type ActivityBodies struct {
+	RequestBody           *string
+	RequestBodyTruncated  bool
+	ResponseBody          *string
+	ResponseBodyTruncated bool
+	ErrorBody             *string
+	ErrorBodyTruncated    bool
+}
+
+// ActivityBodies returns one request's captured bodies, scoped to the account.
+func (s *Scope) ActivityBodies(ctx context.Context, id string) (ActivityBodies, error) {
+	var v ActivityBodies
+	err := s.withActivity(ctx, func(q querier) error {
+		var rt, st, et int
+		err := q.QueryRowContext(ctx, `SELECT request_body,request_body_truncated,response_body,response_body_truncated,error_body,error_body_truncated FROM request_logs WHERE id=? AND account_id=?`, id, s.accountID).Scan(&v.RequestBody, &rt, &v.ResponseBody, &st, &v.ErrorBody, &et)
+		if err != nil {
+			return err
+		}
+		v.RequestBodyTruncated, v.ResponseBodyTruncated, v.ErrorBodyTruncated = rt != 0, st != 0, et != 0
+		return nil
+	})
+	return v, err
+}
+
+func (s *Scope) scanActivityRows(rows *sql.Rows, withBodyFlags, withClientKey, withClientName bool) ([]ActivityRow, error) {
 	defer rows.Close()
 	out := []ActivityRow{}
 	for rows.Next() {
 		var v ActivityRow
-		var streaming, fallback, bodyTruncated, errorTruncated int
-		dest := []any{&v.ID, &v.RequestedModel, &v.ExposedModel, &v.RouteKind, &v.RouteModelID, &v.RouteModel, &v.ResolvedProvider, &v.ResolvedModel, &v.Protocol, &streaming, &v.HTTPStatus, &v.LatencyMs, &v.InputTokens, &v.OutputTokens, &v.CacheReadInputTokens, &v.CacheCreationInputTokens, &v.ProviderRequestID, &v.ClientRequestID, &v.ErrorText, &v.ErrorMessage, &v.RequestBody, &bodyTruncated, &v.ErrorBody, &errorTruncated, &v.AttemptCount, &v.AttemptRows, &fallback, &v.FallbackReason, &v.CreatedAt}
+		var streaming, fallback, bodyTruncated, responseTruncated, errorTruncated int
+		dest := []any{&v.ID, &v.RequestedModel, &v.ExposedModel, &v.RouteKind, &v.RouteModelID, &v.RouteModel, &v.ResolvedProvider, &v.ResolvedModel, &v.Protocol, &streaming, &v.HTTPStatus, &v.LatencyMs, &v.InputTokens, &v.OutputTokens, &v.CacheReadInputTokens, &v.CacheCreationInputTokens, &v.ProviderRequestID, &v.ClientRequestID, &v.ErrorText, &v.ErrorMessage, &v.RequestBody, &bodyTruncated, &v.ResponseBody, &responseTruncated, &v.ErrorBody, &errorTruncated, &v.AttemptCount, &v.AttemptRows, &fallback, &v.FallbackReason, &v.CreatedAt}
 		dest = append(dest, &v.EstimatedCostMicros, &v.ProviderCostMicros, &v.InputTokensSource, &v.OutputTokensSource, &v.ReasoningStripped)
+		if withBodyFlags {
+			dest = append(dest, &v.HasRequestBody, &v.HasResponseBody, &v.HasErrorBody)
+		}
 		if withClientKey {
 			dest = append(dest, &v.ClientKeyID)
 		}
@@ -113,6 +154,7 @@ func (s *Scope) scanActivityRows(rows *sql.Rows, withClientKey, withClientName b
 		v.Streaming = streaming != 0
 		v.FallbackUsed = fallback != 0
 		v.RequestBodyTruncated = bodyTruncated != 0
+		v.ResponseBodyTruncated = responseTruncated != 0
 		v.ErrorBodyTruncated = errorTruncated != 0
 		out = append(out, v)
 	}
@@ -150,11 +192,11 @@ func (s *Scope) ListClientActivity(ctx context.Context, clientID, search string,
 	args = append(args, limit, offset)
 	var out []ActivityRow
 	err := s.withActivity(ctx, func(q querier) error {
-		rows, err := q.QueryContext(ctx, `SELECT `+activityColumns+` FROM request_logs rl WHERE rl.account_id=? AND rl.client_key_id=? AND `+searchClause+` ORDER BY rl.created_at DESC, rl.id DESC LIMIT ? OFFSET ?`, args...)
+		rows, err := q.QueryContext(ctx, `SELECT `+activityListColumns+` FROM request_logs rl WHERE rl.account_id=? AND rl.client_key_id=? AND `+searchClause+` ORDER BY rl.created_at DESC, rl.id DESC LIMIT ? OFFSET ?`, args...)
 		if err != nil {
 			return err
 		}
-		out, err = s.scanActivityRows(rows, false, false)
+		out, err = s.scanActivityRows(rows, true, false, false)
 		return err
 	})
 	return out, err
@@ -169,11 +211,11 @@ func (s *Scope) ListGlobalActivity(ctx context.Context, search string, limit, of
 	args = append(args, limit, offset)
 	var out []ActivityRow
 	err := s.withActivity(ctx, func(q querier) error {
-		rows, err := q.QueryContext(ctx, `SELECT `+activityColumns+`,rl.client_key_id,rl.client_name FROM request_logs rl WHERE rl.account_id=? AND `+searchClause+` ORDER BY rl.created_at DESC, rl.id DESC LIMIT ? OFFSET ?`, args...)
+		rows, err := q.QueryContext(ctx, `SELECT `+activityListColumns+`,rl.client_key_id,rl.client_name FROM request_logs rl WHERE rl.account_id=? AND `+searchClause+` ORDER BY rl.created_at DESC, rl.id DESC LIMIT ? OFFSET ?`, args...)
 		if err != nil {
 			return err
 		}
-		out, err = s.scanActivityRows(rows, true, true)
+		out, err = s.scanActivityRows(rows, true, true, true)
 		return err
 	})
 	return out, err
@@ -195,15 +237,13 @@ func (s *Scope) LiveActivityByIDs(ctx context.Context, ids []string) ([]Activity
 		marks[i] = "?"
 		args = append(args, id)
 	}
-	columns := strings.ReplaceAll(activityColumns, "rl.request_body,", "NULL,")
-	columns = strings.ReplaceAll(columns, "rl.error_body,", "NULL,")
-	columns = strings.ReplaceAll(columns, "rl.error_message,", "NULL,")
+	columns := strings.ReplaceAll(activityMetadataColumns, "rl.error_message,", "NULL,")
 	err := s.withActivity(ctx, func(q querier) error {
 		rows, err := q.QueryContext(ctx, `SELECT `+columns+`,rl.client_key_id,rl.client_name FROM request_logs rl WHERE rl.account_id=? AND rl.id IN (`+strings.Join(marks, ",")+`)`, args...)
 		if err != nil {
 			return err
 		}
-		out, err = s.scanActivityRows(rows, true, true)
+		out, err = s.scanActivityRows(rows, false, true, true)
 		return err
 	})
 	return out, err
@@ -217,11 +257,11 @@ func (s *Scope) ListVirtualActivity(ctx context.Context, virtualID, canonical, s
 	args = append(args, limit, offset)
 	var out []ActivityRow
 	err := s.withActivity(ctx, func(q querier) error {
-		rows, err := q.QueryContext(ctx, `SELECT `+activityColumns+`,rl.client_key_id,rl.client_name FROM request_logs rl WHERE rl.account_id=? AND `+where+` AND `+searchClause+` ORDER BY rl.created_at DESC, rl.id DESC LIMIT ? OFFSET ?`, args...)
+		rows, err := q.QueryContext(ctx, `SELECT `+activityListColumns+`,rl.client_key_id,rl.client_name FROM request_logs rl WHERE rl.account_id=? AND `+where+` AND `+searchClause+` ORDER BY rl.created_at DESC, rl.id DESC LIMIT ? OFFSET ?`, args...)
 		if err != nil {
 			return err
 		}
-		out, err = s.scanActivityRows(rows, true, true)
+		out, err = s.scanActivityRows(rows, true, true, true)
 		return err
 	})
 	return out, err
@@ -235,11 +275,11 @@ func (s *Scope) ListRealModelActivity(ctx context.Context, modelID, provider, up
 	args = append(args, limit, offset)
 	var out []ActivityRow
 	err := s.withActivity(ctx, func(q querier) error {
-		rows, err := q.QueryContext(ctx, `SELECT `+activityColumns+`,rl.client_key_id,rl.client_name FROM request_logs rl WHERE rl.account_id=? AND `+where+` AND `+searchClause+` ORDER BY rl.created_at DESC, rl.id DESC LIMIT ? OFFSET ?`, args...)
+		rows, err := q.QueryContext(ctx, `SELECT `+activityListColumns+`,rl.client_key_id,rl.client_name FROM request_logs rl WHERE rl.account_id=? AND `+where+` AND `+searchClause+` ORDER BY rl.created_at DESC, rl.id DESC LIMIT ? OFFSET ?`, args...)
 		if err != nil {
 			return err
 		}
-		out, err = s.scanActivityRows(rows, true, true)
+		out, err = s.scanActivityRows(rows, true, true, true)
 		return err
 	})
 	return out, err
@@ -275,11 +315,11 @@ func (s *Scope) exportActivity(ctx context.Context, where string, args []any, rn
 		batchArgs = append(batchArgs, activityExportBatchSize)
 		var page []ActivityRow
 		err := s.withActivity(ctx, func(q querier) error {
-			rows, err := q.QueryContext(ctx, `SELECT `+activityColumns+`,rl.client_name FROM request_logs rl WHERE rl.account_id=? AND `+batchWhere+` ORDER BY rl.created_at DESC, rl.id DESC LIMIT ?`, append([]any{s.accountID}, batchArgs...)...)
+			rows, err := q.QueryContext(ctx, `SELECT `+activityListColumns+`,rl.client_name FROM request_logs rl WHERE rl.account_id=? AND `+batchWhere+` ORDER BY rl.created_at DESC, rl.id DESC LIMIT ?`, append([]any{s.accountID}, batchArgs...)...)
 			if err != nil {
 				return err
 			}
-			page, err = s.scanActivityRows(rows, false, true)
+			page, err = s.scanActivityRows(rows, true, false, true)
 			return err
 		})
 		if err != nil {
@@ -288,8 +328,24 @@ func (s *Scope) exportActivity(ctx context.Context, where string, args []any, rn
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		for i := range page {
-			if err := fn(page[i]); err != nil {
+		for _, row := range page {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			// Keep bodies out of the page and release the connection before writing CSV.
+			if row.HasRequestBody || row.HasResponseBody || row.HasErrorBody {
+				bodies, err := s.ActivityBodies(ctx, row.ID)
+				if errors.Is(err, sql.ErrNoRows) {
+					continue // Activity was cleared or pruned after the page read.
+				}
+				if err != nil {
+					return err
+				}
+				row.RequestBody = bodies.RequestBody
+				row.ResponseBody = bodies.ResponseBody
+				row.ErrorBody = bodies.ErrorBody
+			}
+			if err := fn(row); err != nil {
 				return err
 			}
 		}

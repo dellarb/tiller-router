@@ -25,6 +25,7 @@ test('activity records real inference: success, upstream failure, and ordered fa
   await mockFailModel(page, 'mock-model');
 
   const client = await createClient(page, csrf, 'activity-e2e-client');
+  expect((await page.request.patch(`/api/admin/client-keys/${client.id}`, { headers: { 'X-CSRF-Token': csrf }, data: { log_all_bodies: 'always' } })).status()).toBe(204);
 
   // Ordered fallback virtual model: mock-model (500) -> mock-model-b (ok).
   const groupRes = await page.request.post('/api/admin/virtual-groups', { headers: { 'X-CSRF-Token': csrf }, data: { name: 'activity-e2e-group' } });
@@ -60,6 +61,18 @@ test('activity records real inference: success, upstream failure, and ordered fa
   const failure = rows.find(r => r.http_status === 500);
   expect(fallback).toBeTruthy();
   expect(success).toBeTruthy();
+  expect(success.has_request_body).toBe(true);
+  expect(success.has_response_body).toBe(true);
+  for (const row of rows) {
+    expect(row).not.toHaveProperty('request_body');
+    expect(row).not.toHaveProperty('response_body');
+    expect(row).not.toHaveProperty('error_body');
+  }
+  const bodiesRes = await page.request.get(`/api/admin/activity/${success.id}/bodies`);
+  expect(bodiesRes.ok()).toBeTruthy();
+  const bodies = await bodiesRes.json();
+  expect(bodies.request_body).toContain('e2e');
+  expect(bodies.response_body).toBeTruthy();
   expect(failure).toBeTruthy();
 
   // Success row: resolved target, one success attempt.
@@ -93,12 +106,45 @@ test('activity records real inference: success, upstream failure, and ordered fa
   expect(fbAttempts[1].result).toBe('success');
   expect(fbAttempts[1].model).toBe('mock-model-b');
 
+  let bodyRequests = 0;
+  await page.route(`**/api/admin/activity/${success.id}/bodies`, async route => {
+    bodyRequests += 1;
+    if (bodyRequests === 1) await route.fulfill({ status: 503, json: { error: { message: 'Temporarily unavailable' } } });
+    else await route.continue();
+  });
+  let releaseFallbackAttempts;
+  const fallbackAttemptsReady = new Promise(resolve => { releaseFallbackAttempts = resolve; });
+  await page.route(`**/api/admin/activity/${fallback.id}/attempts`, async route => {
+    await fallbackAttemptsReady;
+    await route.continue();
+  });
+
   // The Activity UI renders the three real-inference rows (global view; the
   // lane was cleared at the start so these are the only rows).
   await page.locator('#nav-links').getByRole('link', { name: 'Activity' }).click();
   await page.locator('[data-activity-tab="history"]').click();
   await expect(page.locator('#activity-panel-history')).toBeVisible();
   await expect(page.locator('#global-activity-body tr')).toHaveCount(3);
+  expect(bodyRequests).toBe(0);
+  await page.locator(`#global-activity-body [data-activity-row="${success.id}"] .attempt-success[data-error-key]`).click();
+  await expect(page.locator('#error-body')).toContainText('Could not load message bodies');
+  await page.locator('#retry-error-bodies').click();
+  await expect(page.locator('#error-body')).toContainText('Client request body:');
+  await expect(page.locator('#error-body')).toContainText('Client response body:');
+  await page.locator('#done-error').click();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  for (const row of [success, fallback]) {
+    const card = page.locator(`#global-activity-cards [data-activity-row="${row.id}"]`);
+    await card.locator('.attempt-success[data-error-key]').click();
+    await expect(page.locator('#error-body')).toContainText('Client request body:');
+    await expect(page.locator('#error-body')).toContainText('Client response body:');
+    await page.locator('#done-error').click();
+  }
+  expect(bodyRequests).toBe(2); // The mobile view reuses the loaded direct request.
+  releaseFallbackAttempts();
+  await page.unroute(`**/api/admin/activity/${fallback.id}/attempts`);
+  await page.setViewportSize({ width: 1440, height: 900 });
 
   // Opening a client Activity dialog renders the newest window immediately and
   // backfills attempt details as rows scroll into view. There is no "Show
@@ -117,6 +163,13 @@ test('activity records real inference: success, upstream failure, and ordered fa
   await expect(page.locator('#activity-body .activity-attempts-load')).toHaveCount(0);
   await expect.poll(() => attemptRequests).toBeGreaterThan(0);
   await expect(page.locator('#activity-body .attempt-failed').first()).toBeVisible();
+  await page.locator('#done-activity').click();
+
+  // The previously rendered global view remains mounted when Clients is shown.
+  const globalDetail = page.locator(`#global-activity-body [data-activity-row="${failure.id}"] .activity-error-box`);
+  await globalDetail.dispatchEvent('click');
+  await expect(page.locator('#error-body')).toContainText('HTTP status: 500');
+  await page.locator('#done-error').click();
 });
 
 // Data-volume: 55 rows seeded directly (28 client-one + 27 client-two) exercise
@@ -288,4 +341,82 @@ test('activity shows metadata-only reasoning degradation on desktop and mobile',
   await expect(page.locator('#global-activity-body .activity-reasoning-warning')).toHaveText('Reasoning history omitted');
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.locator('.history-card:visible .activity-reasoning-warning')).toHaveText('Reasoning history omitted');
+});
+
+// Every failure renders as the red error box (model name + status, one-line
+// summary, click-through for details) — never as bare red text. Covers the
+// three request shapes: an ordered-fallback request (resolved target plus a
+// failed first attempt), a request-level failure with no attempt rows to
+// render, and the mobile card. All rows are stubbed so the lanes stay fast.
+test('activity renders every failure as a clickable error box, not bare text', async ({ page }) => {
+  await openAdmin(page);
+  const fallbackRow = {
+    id: 'errbox-fallback', requested_model: 'fixture-provider/mock-model-b', protocol: 'chat', streaming: false,
+    http_status: 200, latency_ms: 120, attempt_count: 2, attempt_rows: 2,
+    resolved_provider: 'fixture-provider', resolved_model: 'mock-model-b',
+    fallback_used: true, fallback_reason: 'http_500', error_text: 'upstream_error',
+    error_message: 'The upstream provider returned an error', client_name: 'errbox client',
+    client_request_id: 'errbox-fallback', created_at: '2026-01-01T00:00:00Z',
+  };
+  const preAttemptRow = {
+    id: 'errbox-pre', requested_model: 'missing-model', protocol: 'chat', streaming: false,
+    http_status: 404, latency_ms: 2, attempt_count: 0, attempt_rows: 0,
+    error_text: 'model_not_found', error_message: 'The requested model was not found or is not configured',
+    client_name: 'errbox client', client_request_id: 'errbox-pre', created_at: '2026-01-01T00:00:00Z',
+  };
+  await page.route('**/api/admin/activity?*', route => route.fulfill({ json: { data: [fallbackRow, preAttemptRow], limit: 20, offset: 0 } }));
+  await page.route('**/api/admin/activity/*/attempts', route => route.fulfill({ json: { data: [
+    { attempt_number: 1, provider: 'fixture-provider', model: 'mock-model-a', result: 'failed', http_status: 500, failure_class: 'http_500', latency_ms: 90, created_at: '2026-01-01T00:00:00Z' },
+    { attempt_number: 2, provider: 'fixture-provider', model: 'mock-model-b', result: 'success', http_status: 200, latency_ms: 30, created_at: '2026-01-01T00:00:10Z' },
+  ] } }));
+  await page.locator('#nav-links').getByRole('link', { name: 'Activity' }).click();
+  await page.locator('[data-activity-tab="history"]').click();
+  await expect(page.locator('#activity-panel-history')).toBeVisible();
+
+  // No failure may fall back to the old bare red text span.
+  await expect(page.locator('#global-activity-body .error-text')).toHaveCount(0);
+
+  // Ordered fallback: the attempt chain renders *and* the request-level failure
+  // keeps its own red box (previously it was silently dropped). Rows are keyed
+  // by request-id, not row text — both stub rows carry the same client name.
+  const fallbackCells = page.locator('#global-activity-body tr').filter({ has: page.locator('[data-activity-resolved="errbox-fallback"]') });
+  await expect(fallbackCells).toHaveCount(1);
+  // The two attempt rows plus the request-level error box (also an .activity-attempt).
+  await expect(fallbackCells.locator('.activity-attempt')).toHaveCount(3);
+  const fallbackBox = fallbackCells.locator('.activity-error-box');
+  await expect(fallbackBox).toHaveCount(1);
+  await expect(fallbackBox.locator('.model-id')).toHaveText('fixture-provider/mock-model-b');
+  await expect(fallbackBox.locator('.attempt-error-summary')).toHaveText('Upstream returned an error');
+  await expect(fallbackBox.locator('.attempt-status')).toHaveText('failed');
+
+  // Pre-attempt failure: no target resolved, so the box names the requested
+  // model and carries the human summary for the class.
+  const preCells = page.locator('#global-activity-body tr').filter({ has: page.locator('[data-activity-resolved="errbox-pre"]') });
+  await expect(preCells).toHaveCount(1);
+  await expect(preCells.locator('.error-text')).toHaveCount(0);
+  const preBox = preCells.locator('.activity-error-box');
+  await expect(preBox).toHaveCount(1);
+  await expect(preBox.locator('.model-id')).toHaveText('missing-model');
+  await expect(preBox.locator('.attempt-error-summary')).toHaveText('Model not found');
+
+  // Clicking the box opens the detail dialog with the full error class text.
+  await preBox.click();
+  await expect(page.locator('#error-dialog')).toBeVisible();
+  await expect(page.locator('#error-title')).toContainText('missing-model');
+  await expect(page.locator('#error-body')).toContainText('model_not_found');
+  await expect(page.locator('#error-body')).toContainText('HTTP status: 404');
+  await page.locator('#done-error').click();
+  await expect(page.locator('#error-dialog')).toBeHidden();
+
+  // The mobile card shows the same box, not a bare text span.
+  await page.setViewportSize({ width: 390, height: 844 });
+  // Global history renders its mobile cards into #global-activity-cards.
+  const card = page.locator('#global-activity-cards .history-card').filter({ has: page.locator('[data-activity-resolved="errbox-pre"]') });
+  await expect(card).toBeVisible();
+  await expect(card.locator('.history-error .activity-error-box')).toHaveCount(1);
+  await expect(card.locator('.error-text')).toHaveCount(0);
+  await expect(card.locator('.history-error .attempt-error-summary')).toHaveText('Model not found');
+  await card.locator('.history-error .activity-error-box').click();
+  await expect(page.locator('#error-body')).toContainText('model_not_found');
+  await page.locator('#done-error').click();
 });

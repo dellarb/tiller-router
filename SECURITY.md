@@ -187,9 +187,10 @@ passwords use Argon2id (64 MiB/3/4); verification and reset links are opaque,
 single-use, short-lived, and hash-only at rest. Customer sessions and platform
 operator sessions use separate host-only Secure/HttpOnly/SameSite cookies and
 CSRF tokens. Account suspension immediately revokes customer sessions and
-blocks client-key traffic. Hosted detailed body logging is off by default and
-only ever captures when the account operator opts in (see *Detailed error
-logging* below). Customer login and recovery
+blocks client-key traffic. Both hosted body logging settings default to off.
+An account operator can opt in account-wide or per client. The published hosted
+Privacy Policy should describe captured content, Activity retention and CSV
+exports. Customer login and recovery
 requests have in-memory per-IP budgets; login and recovery also use normalized-
 email keyed throttles. The per-email login failure lockout can temporarily block
 an account after repeated failed attempts regardless of source IP; this targeted
@@ -265,6 +266,17 @@ Activity detail views and CSV exports, and are retained under the client key's
 retention window. Turning the setting off stops new captures; it does not purge
 bodies already stored. Deleting the account removes them along with the rest of
 its Activity history.
+
+**All message body logging (opt-in).** A separate Log All Message Bodies setting
+captures client request and client-visible response bodies for successful and
+failed requests, in local and hosted mode. It is off by default and has its
+own per-client inherit/always/never override. Normal client activity logging
+must also be enabled. Each body is bounded to 1 MiB; streaming responses are
+recorded as client-visible wire events, including any keepalives. The captured
+content can include prompts, tool arguments, and reasoning. It is retained under
+the client key's Activity retention, appears in authenticated Activity views
+and CSV exports, and is excluded from live Activity events. Switching it off
+stops new capture without deleting prior records. Expect increased storage use.
 
 **Hosted quota and onboarding controls.** Hosted accounts are subject to plan
 entitlements (provider/client-key/virtual-model creation, concurrent streams,

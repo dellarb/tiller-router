@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -44,6 +45,26 @@ type requestAttemptView struct {
 	CreatedAt          string  `json:"created_at"`
 }
 
+// getActivityBodies returns one request's captured message bodies. The list
+// endpoints omit them; the console fetches them when a request is opened.
+func (s *Server) getActivityBodies(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	v, err := s.scope(r).ActivityBodies(r.Context(), r.PathValue("id"))
+	if errors.Is(err, sql.ErrNoRows) {
+		adminError(w, 404, "not_found", "Request not found.")
+		return
+	}
+	if err != nil {
+		activityReadError(w, err, "Could not load request bodies.")
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"request_body": v.RequestBody, "request_body_truncated": v.RequestBodyTruncated,
+		"response_body": v.ResponseBody, "response_body_truncated": v.ResponseBodyTruncated,
+		"error_body": v.ErrorBody, "error_body_truncated": v.ErrorBodyTruncated,
+	})
+}
+
 func (s *Server) listRequestAttempts(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.scope(r).ListRequestAttempts(r.Context(), r.PathValue("id"))
 	if err != nil {
@@ -83,16 +104,20 @@ type activityView struct {
 	ClientRequestID          string  `json:"client_request_id"`
 	ErrorText                *string `json:"error_text"`
 	ErrorMessage             *string `json:"error_message"`
-	RequestBody              *string `json:"request_body"`
-	RequestBodyTruncated     bool    `json:"request_body_truncated"`
-	ErrorBody                *string `json:"error_body"`
-	ErrorBodyTruncated       bool    `json:"error_body_truncated"`
-	AttemptCount             int     `json:"attempt_count"`
-	AttemptRows              int     `json:"attempt_rows"`
-	ReasoningStripped        bool    `json:"reasoning_stripped"`
-	FallbackUsed             bool    `json:"fallback_used"`
-	FallbackReason           *string `json:"fallback_reason"`
-	CreatedAt                string  `json:"created_at"`
+	// Bodies are not listed; the flags say a body exists and
+	// GET /api/admin/activity/{id}/bodies returns it on demand.
+	HasRequestBody        bool    `json:"has_request_body"`
+	RequestBodyTruncated  bool    `json:"request_body_truncated"`
+	HasResponseBody       bool    `json:"has_response_body"`
+	ResponseBodyTruncated bool    `json:"response_body_truncated"`
+	HasErrorBody          bool    `json:"has_error_body"`
+	ErrorBodyTruncated    bool    `json:"error_body_truncated"`
+	AttemptCount          int     `json:"attempt_count"`
+	AttemptRows           int     `json:"attempt_rows"`
+	ReasoningStripped     bool    `json:"reasoning_stripped"`
+	FallbackUsed          bool    `json:"fallback_used"`
+	FallbackReason        *string `json:"fallback_reason"`
+	CreatedAt             string  `json:"created_at"`
 }
 
 func activityViewFromStore(row store.ActivityRow) activityView {
@@ -121,9 +146,11 @@ func activityViewFromStore(row store.ActivityRow) activityView {
 		ClientRequestID:          row.ClientRequestID,
 		ErrorText:                row.ErrorText,
 		ErrorMessage:             row.ErrorMessage,
-		RequestBody:              row.RequestBody,
+		HasRequestBody:           row.HasRequestBody,
 		RequestBodyTruncated:     row.RequestBodyTruncated,
-		ErrorBody:                row.ErrorBody,
+		HasResponseBody:          row.HasResponseBody,
+		ResponseBodyTruncated:    row.ResponseBodyTruncated,
+		HasErrorBody:             row.HasErrorBody,
 		ErrorBodyTruncated:       row.ErrorBodyTruncated,
 		AttemptCount:             row.AttemptCount,
 		AttemptRows:              row.AttemptRows,
@@ -312,9 +339,8 @@ func (s *Server) exportGlobalActivityCSV(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-// writeActivityCSV streams the export rows as a UTF-8 CSV attachment. Only
-// metadata is written; unknown values stay blank. A BOM is prepended so Excel
-// detects UTF-8 correctly.
+// writeActivityCSV streams metadata and any captured bodies as a UTF-8 CSV
+// attachment. Unknown values stay blank. A BOM helps Excel detect UTF-8.
 func (s *Server) writeActivityCSV(w http.ResponseWriter, r *http.Request, filename string, run func(fn func(store.ActivityRow) error) error) error {
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
@@ -333,7 +359,7 @@ func (s *Server) writeActivityCSV(w http.ResponseWriter, r *http.Request, filena
 		"timestamp", "client_key", "client_requested_model", "client_exposed_model",
 		"virtual_model", "bound_target", "final_provider", "final_model", "protocol",
 		"streaming", "http_status", "latency_ms", "input_tokens", "output_tokens",
-		"cached_input_tokens", "cache_creation_input_tokens", "attempt_count", "fallback_used", "fallback_reason", "error_message", "request_body", "request_body_truncated", "error_body", "error_body_truncated",
+		"cached_input_tokens", "cache_creation_input_tokens", "attempt_count", "fallback_used", "fallback_reason", "error_message", "request_body", "request_body_truncated", "response_body", "response_body_truncated", "error_body", "error_body_truncated",
 		"provider_request_id", "client_request_id", "route_kind",
 		"estimated_cost_micros", "provider_cost_micros", "input_tokens_source", "output_tokens_source", "reasoning_stripped",
 	}); err != nil {
@@ -355,6 +381,7 @@ func (s *Server) writeActivityCSV(w http.ResponseWriter, r *http.Request, filena
 			int64PtrOrEmpty(row.CacheCreationInputTokens), strconv.Itoa(row.AttemptCount), strconv.FormatBool(row.FallbackUsed),
 			strPtrOrEmpty(row.FallbackReason), neutralizeCSVField(strPtrOrEmpty(row.ErrorMessage)),
 			neutralizeCSVField(strPtrOrEmpty(row.RequestBody)), strconv.FormatBool(row.RequestBodyTruncated),
+			neutralizeCSVField(strPtrOrEmpty(row.ResponseBody)), strconv.FormatBool(row.ResponseBodyTruncated),
 			neutralizeCSVField(strPtrOrEmpty(row.ErrorBody)), strconv.FormatBool(row.ErrorBodyTruncated),
 			neutralizeCSVField(strPtrOrEmpty(row.ProviderRequestID)), row.ClientRequestID, strPtrOrEmpty(row.RouteKind),
 			int64PtrOrEmpty(row.EstimatedCostMicros), int64PtrOrEmpty(row.ProviderCostMicros), strPtrOrEmpty(row.InputTokensSource), strPtrOrEmpty(row.OutputTokensSource), strconv.FormatBool(row.ReasoningStripped),

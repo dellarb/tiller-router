@@ -244,6 +244,7 @@ const rowCache = (row) => {
 };
 const VIEWS = ['providers', 'virtual', 'clients', 'activity', 'settings'];
 const viewFromHash = () => { const raw = (location.hash.replace(/^#\/?/, '') || 'clients'); const v = raw.split('/')[0]; return v === 'models' ? 'providers' : VIEWS.includes(v) ? v : 'clients'; };
+const providerFromHash = () => { const match = location.hash.match(/^#providers\/([^/]+)$/); if (!match) return ''; try { return decodeURIComponent(match[1]); } catch { return ''; } };
 const activityTabFromHash = () => { const parts = location.hash.replace(/^#\/?/, '').split('/'); return parts[0] === 'activity' && parts[1] === 'history' ? 'history' : 'live'; };
 const settingsTabFromHash = () => { const parts = location.hash.replace(/^#\/?/, '').split('/'); return parts[0] === 'settings' && parts[1] ? parts[1] : ''; };
 
@@ -393,7 +394,7 @@ function showBootSkeleton() { const boot = $('#boot-shell'); if (boot) boot.hidd
 function setSessionHint(on) { try { if (on) localStorage.setItem(UI_SESSION_HINT, '1'); else localStorage.removeItem(UI_SESSION_HINT); } catch { /* storage unavailable */ } }
 function sessionHint() { try { return localStorage.getItem(UI_SESSION_HINT) === '1'; } catch { return false; } }
 function isPlatformRoute(path = location.pathname) { return path === '/platform' || path === '/platform/'; }
-function showLogin() { hideBoot(); $('#app').hidden = true; $('#platform-shell').hidden = true; $('#legal-shell').hidden = true; $('#feedback-shell').hidden = true; $('#account-delete-shell').hidden = true; $('#account-google-link-shell').hidden = true; $('#login-shell').hidden = false; state.csrf = ''; setSessionHint(false); const platform = runtimeMode === 'hosted' && isPlatformRoute(); const setup = runtimeMode === 'local' && runtimeSetupRequired; authView(platform ? 'platform-login-form' : setup ? 'setup-form' : 'login-form'); const platformHash = platform ? location.hash : ''; history.replaceState(null, '', platform ? `/platform${platformHash}` : (runtimeMode === 'hosted' ? '/login' : '/')); liveStop(); refreshAuthOptions(); }
+function showLogin() { hideBoot(); $('#app').hidden = true; $('#platform-shell').hidden = true; $('#legal-shell').hidden = true; $('#feedback-shell').hidden = true; $('#account-delete-shell').hidden = true; $('#account-google-link-shell').hidden = true; $('#login-shell').hidden = false; state.csrf = ''; setSessionHint(false); const platform = runtimeMode === 'hosted' && isPlatformRoute(); const setup = runtimeMode === 'local' && runtimeSetupRequired; authView(platform ? 'platform-login-form' : setup ? 'setup-form' : 'login-form'); const hash = platform || providerFromHash() ? location.hash : ''; history.replaceState(null, '', platform ? `/platform${hash}` : (runtimeMode === 'hosted' ? `/login${hash}` : `/${hash}`)); liveStop(); refreshAuthOptions(); }
 // refreshAuthOptions re-reads what the login card greys in or out (passkey and
 // Google sign-in, signup, Turnstile) and repaints it. The flags it refreshes
 // come from /api/runtime and /api/auth/options, which used to be fetched once in
@@ -441,7 +442,7 @@ function renderIdentity(session) {
   identity.disabled = !hosted;
   identity.title = hosted ? 'Account settings' : '';
 }
-function showApp(session) { hideBoot(); state.csrf = session.csrf_token; setSessionHint(true); renderIdentity(session); $('#login-shell').hidden = true; $('#platform-shell').hidden = true; $('#legal-shell').hidden = true; $('#feedback-shell').hidden = true; $('#account-delete-shell').hidden = true; $('#account-google-link-shell').hidden = true; $('#app').hidden = false; $('#app-footer').hidden = runtimeMode !== 'hosted'; liveStart(); navigate(state.view); if (runtimeMode === 'hosted') { renderFooterFeedback(); refreshWizardButton(true); loadPlanSnapshot(); } else if (runtimeWizardEnabled) { refreshWizardButton(true); } }
+function showApp(session) { hideBoot(); state.csrf = session.csrf_token; setSessionHint(true); renderIdentity(session); $('#login-shell').hidden = true; $('#platform-shell').hidden = true; $('#legal-shell').hidden = true; $('#feedback-shell').hidden = true; $('#account-delete-shell').hidden = true; $('#account-google-link-shell').hidden = true; $('#app').hidden = false; $('#app-footer').hidden = runtimeMode !== 'hosted'; if (providerFromHash()) { history.replaceState(history.state, '', '/' + location.hash); state.view = 'providers'; } liveStart(); navigate(state.view, { fromLocation: true }); if (runtimeMode === 'hosted') { renderFooterFeedback(); refreshWizardButton(true); loadPlanSnapshot(); } else if (runtimeWizardEnabled) { refreshWizardButton(true); } }
 function showAccountDeleteConfirmation({ email, google, passkey = false }) {
   hideBoot();
   $('#app').hidden = true; $('#login-shell').hidden = true; $('#platform-shell').hidden = true; $('#legal-shell').hidden = true; $('#feedback-shell').hidden = true; $('#account-google-link-shell').hidden = true;
@@ -850,7 +851,7 @@ async function handleGoogleCredential(response) {
     if (result?.link_required) { $('#google-link-confirm-message').textContent = `A Tiller account already exists for ${result.email}. Link this Google account to sign in to it?`; history.replaceState(null, '', '/login'); authView('google-link-confirm-form'); return; }
     if (result?.link_challenge_required) { history.replaceState(null, '', '/login'); authView('login-form'); $('#login-error').textContent = `A Tiller account already exists for ${result.email}. Sign in with your password to continue, and we will offer to link Google.`; return; }
     if (result?.signup_required) { history.replaceState(null, '', '/login?google_signup=1'); authView('google-consent-form'); return; }
-    history.replaceState(null, '', '/#clients'); showApp(result);
+    if (!providerFromHash()) history.replaceState(null, '', '/#clients'); showApp(result);
   } catch (error) { showAuthError('login-error', error, 'Google sign-in could not be completed.'); }
 }
 $('#google-consent-cancel').onclick = () => { history.replaceState(null, '', '/login'); authView('login-form'); };
@@ -962,13 +963,13 @@ window.addEventListener('popstate', () => {
 });
 $('#platform-stats-refresh').addEventListener('click', () => loadPlatformDashboard('overview').catch(error => setPlatformStatsUnavailable(errorMessage(error, 'Could not load platform statistics.'))));
 
-async function navigate(view) {
+async function navigate(view, { fromLocation = false } = {}) {
   const legacyModelsHash = location.hash === '#models';
   if (view === 'models') view = 'providers';
-  if (view !== 'providers' && drawerProviderID) closeProviderDrawer(false);
+  if ((view !== 'providers' || !fromLocation || !providerFromHash()) && drawerProviderID) closeProviderDrawer(false);
   state.view = view;
   // Preserve the settings sub-tab in the hash; only the base view is rewritten.
-  const desiredHash = view === 'settings' ? ('#settings' + (settingsTabFromHash() && settingsTabFromHash() !== 'routing' ? '/' + settingsTabFromHash() : '')) : view === 'activity' && activityTabFromHash() === 'history' ? '#activity/history' : '#' + view;
+  const desiredHash = view === 'providers' && fromLocation && providerFromHash() ? location.hash : view === 'settings' ? ('#settings' + (settingsTabFromHash() && settingsTabFromHash() !== 'routing' ? '/' + settingsTabFromHash() : '')) : view === 'activity' && activityTabFromHash() === 'history' ? '#activity/history' : '#' + view;
   if (location.hash !== desiredHash) {
     if (legacyModelsHash) history.replaceState(null, '', desiredHash);
     else history.pushState(null, '', desiredHash);
@@ -987,7 +988,7 @@ $('#admin-name').addEventListener('click', () => {
   if (location.hash !== '#settings/account') history.pushState(null, '', '#settings/account');
   navigate('settings');
 });
-window.addEventListener('popstate', () => { if (!isPlatformRoute()) navigate(viewFromHash()); });
+window.addEventListener('popstate', () => { if (!isPlatformRoute() && !$('#app').hidden) navigate(viewFromHash(), { fromLocation: true }); });
 $$('[data-refresh-view]').forEach(button => button.addEventListener('click', () => navigate(button.dataset.refreshView)));
 $$('[data-filter-toggle]').forEach(button => button.addEventListener('click', () => {
   const bar = button.closest('[data-filter-bar]');
@@ -1004,7 +1005,7 @@ function filterInput(selector, callback) { $(selector).addEventListener('input',
 filterInput('#provider-search', value => { providerSearchValue = value; loadProviders(value); }); filterInput('#virtual-search', loadVirtual); filterInput('#client-search', loadClients);
 $('#show-retired').addEventListener('change', event => { $('#drawer-show-retired').checked = event.target.checked; renderModels(); });
 $('#drawer-show-retired').addEventListener('change', event => { $('#show-retired').checked = event.target.checked; renderModels(); });
-$('#provider-drawer-close').addEventListener('click', closeProviderDrawer);
+$('#provider-drawer-close').addEventListener('click', () => { if (history.state?.providerDetail) history.back(); else { history.replaceState(null, '', '#providers'); closeProviderDrawer(); } });
 $('#drawer-refresh').addEventListener('click', async () => { if (drawerProviderID) await refreshProvider(drawerProviderID); });
 $('#drawer-edit').addEventListener('click', () => { const provider = state.providers.find(item => item.id === drawerProviderID); if (provider) openProvider(provider); });
 $('#drawer-delete').addEventListener('click', async () => { if (drawerProviderID) await deleteProvider(drawerProviderID); });
@@ -1016,6 +1017,16 @@ async function loadProviders(search = $('#provider-search').value) {
   if (token !== state.loadToken) return;
   const term = (search || '').trim().toLowerCase();
   state.providers = result.data; state.providerTypes = types.data; state.models = models.data;
+  const requestedProvider = state.view === 'providers' ? providerFromHash() : '';
+  if (requestedProvider && !state.providers.some(provider => provider.id === requestedProvider)) {
+    for (let offset = 0; ; offset += 200) {
+      const page = await api(`/api/admin/providers?limit=200&offset=${offset}`);
+      if (token !== state.loadToken || providerFromHash() !== requestedProvider) return;
+      const provider = page.data.find(item => item.id === requestedProvider);
+      if (provider) { state.providers.push(provider); break; }
+      if (page.data.length < 200) break;
+    }
+  }
   renderModels();
   const matchingProviders = term ? [...new Map([
     ...result.data.filter(provider => provider.name.toLowerCase().includes(term) || typeLabel(provider.type).toLowerCase().includes(term)).map(provider => [provider.id, provider]),
@@ -1024,7 +1035,9 @@ async function loadProviders(search = $('#provider-search').value) {
   renderProviders(matchingProviders);
   loadQuota();
   deferUsage();
-  if (drawerProviderID && !state.providers.some(provider => provider.id === drawerProviderID)) closeProviderDrawer();
+  if (requestedProvider && !state.providers.some(provider => provider.id === requestedProvider)) { history.replaceState(null, '', '#providers'); if (drawerProviderID) closeProviderDrawer(); flash('Provider not found.', 'error'); }
+  else if (requestedProvider && drawerProviderID !== requestedProvider) openProviderDrawer(requestedProvider, false);
+  else if (drawerProviderID && !state.providers.some(provider => provider.id === drawerProviderID)) closeProviderDrawer();
   else if (drawerProviderID) {
     const provider = state.providers.find(item => item.id === drawerProviderID);
     $('#provider-drawer-title').textContent = provider.name;
@@ -1323,11 +1336,13 @@ function openManualModel(preferredProviderID = '') {
 }
 $('#add-real-model').onclick = () => openManualModel(drawerProviderID);
 async function loadModels(search = $('#model-search').value) { drawerModelSearch = (search || '').trim().toLowerCase(); const provider = state.providers.find(item => item.id === drawerProviderID); if (provider) $('#provider-drawer-meta').textContent = `${provider.available_model_count} available · ${provider.model_count - provider.available_model_count} retired · Refreshed ${date(provider.last_refresh_at)}`; renderModels(); deferUsage(); }
-function openProviderDrawer(id) {
-  drawerProviderID = id;
+function openProviderDrawer(id, push = true) {
   drawerModelSearch = '';
   const provider = state.providers.find(item => item.id === id);
   if (!provider) return;
+  drawerProviderID = id;
+  const hash = `#providers/${encodeURIComponent(id)}`;
+  if (push && location.hash !== hash) history.pushState({ providerDetail: true }, '', hash);
   $('#provider-drawer-title').textContent = provider.name;
   $('#provider-drawer-meta').textContent = `${provider.available_model_count} available · ${provider.model_count - provider.available_model_count} retired · Refreshed ${date(provider.last_refresh_at)}`;
   $('#add-real-model').disabled = !provider.enabled;
@@ -2248,12 +2263,12 @@ function openClient(client = null, onSaved = null, defaultType = null) {
   const catalogueAccessField = !client && !onSaved ? `<label data-catalogue-access-field hidden>Catalogue access <select name="catalogue_access"><option value="custom">Custom — choose models after creating</option><option value="all">All models — every model in the current catalogue</option>${templates.map(t => `<option value="template:${h(t.id)}">Template · ${h(t.name)}</option>`).join('')}</select><small>${templates.length ? 'Saved catalogues are managed from Catalogue templates.' : 'No saved catalogues yet — choose Custom or All models.'}</small></label>` : '';
   // Settings only links to the catalogue screen for an existing Catalogue client.
   const catalogueField = client?.type === 'catalogue' ? `<div class="settings-catalogue" data-catalogue-fields><button class="btn btn-small btn-secondary" type="button" data-open-catalogue>${h(catalogueLabel(client))} · Manage models</button></div>` : '';
-  // Detailed error bodies are opt-in per client, in every mode: the control is
-  // only meaningful once the account's detailed error logging is on, so it is
-  // shown wherever the account allows it (see the settings Logging card).
+  // Each client can inherit, enable, or disable either account-level opt-in.
   const bodyLog = client?.log_error_bodies || 'inherit';
   const bodyLogField = `<fieldset class="client-body-log"><legend>Log error bodies</legend><div class="client-body-log-options">${[['inherit', 'Account default'], ['always', 'On'], ['never', 'Off']].map(([value, label]) => `<label><input type="radio" name="log_error_bodies" value="${value}" ${bodyLog === value ? 'checked' : ''}><span>${label}</span></label>`).join('')}</div></fieldset>`;
-  const operationalFields = client ? `<label class="toggle-label"><input class="switch" name="logging_enabled" type="checkbox" ${client.logging_enabled ? 'checked' : ''}> Log requests for this client</label>${bodyLogField}<label>Retention (days) <input autocomplete="off" name="retention_days" type="number" min="1" step="1" value="${h(client.retention_days)}" required><small>Request logs older than this are pruned.</small></label>` : '';
+  const allBodyLog = client?.log_all_bodies || 'inherit';
+  const allBodyLogField = `<fieldset class="client-body-log"><legend>Log all message bodies</legend><div class="client-body-log-options">${[['inherit', 'Account default'], ['always', 'On'], ['never', 'Off']].map(([value, label]) => `<label><input type="radio" name="log_all_bodies" value="${value}" ${allBodyLog === value ? 'checked' : ''}><span>${label}</span></label>`).join('')}</div></fieldset>`;
+  const operationalFields = client ? `<label class="toggle-label"><input class="switch" name="logging_enabled" type="checkbox" ${client.logging_enabled ? 'checked' : ''}> Log requests for this client</label>${bodyLogField}${allBodyLogField}<label>Retention (days) <input autocomplete="off" name="retention_days" type="number" min="1" step="1" value="${h(client.retention_days)}" required><small>Request logs older than this are pruned.</small></label>` : '';
   openEntity({
     eyebrow: client ? 'CLIENT SETTINGS' : 'ISSUE CREDENTIAL',
     title: client ? `Settings · ${client.name}` : 'Create client',
@@ -2282,6 +2297,7 @@ function openClient(client = null, onSaved = null, defaultType = null) {
         payload.enabled = values.get('enabled') === 'on';
         payload.logging_enabled = values.get('logging_enabled') === 'on';
         payload.log_error_bodies = values.get('log_error_bodies') || 'inherit';
+        payload.log_all_bodies = values.get('log_all_bodies') || 'inherit';
         payload.retention_days = Number(values.get('retention_days'));
         payload.type = values.get('type');
         if (payload.type === 'single') {
@@ -2627,22 +2643,144 @@ const ATTEMPT_HYDRATE_CONCURRENCY = 4;
 
 function activityNeedsAttempts(row) { return !row.attempts && !row.attemptsError && (row.attempt_rows > 1 || row.error_text || row.fallback_used); }
 
+// errorClassSummary is the short, human-facing label for a failure class. It is
+// the one-liner shown inside the red error box; the full class plus the
+// provider's own message live behind the click-through in #error-dialog. Classes
+// without an entry fall back to the raw identifier so nothing is ever hidden.
+const ERROR_CLASS_SUMMARIES = {
+  upstream_timeout: 'Upstream timed out',
+  upstream_unreachable: 'Upstream unreachable',
+  upstream_read_error: 'Upstream read failed',
+  upstream_error: 'Upstream returned an error',
+  upstream_stream_error: 'Upstream stream error',
+  upstream_stream_incomplete: 'Upstream stream incomplete',
+  upstream_stream_eof: 'Upstream stream ended early',
+  upstream_response_too_large: 'Response too large',
+  empty_response: 'Upstream returned no content',
+  model_not_found: 'Model not found',
+  model_unavailable: 'Model unavailable',
+  virtual_model_unavailable: 'Virtual model unavailable',
+  protocol_unavailable: 'Protocol not supported',
+  context_limit_exceeded: 'Context window exceeded',
+  reasoning_roundtrip_required: 'Reasoning history required',
+  unsupported_feature: 'Unsupported feature',
+  invalid_request: 'Request rejected',
+  translation_error: 'Translation failed',
+  database_error: 'Internal database error',
+  provider_credentials_locked: 'Provider credentials locked',
+  client_cancelled: 'Client cancelled',
+  client_timeout: 'Client timed out',
+  free_model_requires_keyless: 'Free model needs no key',
+  free_tier_rejected: 'Free tier rejected',
+  stream_time_limit: 'Stream time limit reached',
+  account_suspended: 'Account suspended',
+};
+function errorClassSummary(cls) {
+  if (!cls) return 'Request failed';
+  if (ERROR_CLASS_SUMMARIES[cls]) return ERROR_CLASS_SUMMARIES[cls];
+  const status = /^http_(\d{3})$/.exec(cls);
+  return status ? `HTTP ${status[1]}` : cls;
+}
+// errorRouteLabel names the target an error is attached to. A request that
+// never reached a target (model_not_found, protocol_unavailable, …) is labelled
+// with the model the client asked for, which is the name the operator recogises.
+function errorRouteLabel(provider, model, fallback) {
+  if (provider) return model ? `${provider}/${model}` : provider;
+  return fallback || 'router';
+}
+// Each view owns the details for its rendered nodes.
+let errorDetailSeq = 0;
+const errorScopes = new Map();
+let activeErrorScope;
+function createErrorScope(name) {
+  const details = new Map();
+  errorScopes.set(name, details);
+  return {
+    details,
+    clear() { details.clear(); },
+    run(render) {
+      const previous = activeErrorScope;
+      activeErrorScope = name;
+      try { return render(); } finally { activeErrorScope = previous; }
+    },
+  };
+}
+const dialogErrors = createErrorScope('dialog');
+const globalErrors = createErrorScope('global');
+const liveErrors = createErrorScope('live');
+function registerErrorDetail(detail) {
+  const key = `${activeErrorScope}:${++errorDetailSeq}`;
+  errorScopes.get(activeErrorScope).set(key, detail);
+  return key;
+}
+function removeErrorDetails(container, details) {
+  container.querySelectorAll('[data-error-key]').forEach(node => details.delete(node.dataset.errorKey));
+}
+// Captured message bodies are not in list rows (has_*_body flags only). A detail
+// carrying {lazy: {row, want}} fetches them when it is opened.
+const BODY_SECTIONS = { error: 'Provider error body', request: 'Client request body', response: 'Client response body' };
+function lazyBodies(row, want) {
+  const available = want.filter(kind => row[`has_${kind}_body`]);
+  return available.length ? { row, want: available } : null;
+}
+function bodySections(bodies, want) {
+  return want.filter(kind => bodies[`${kind}_body`] != null).map(kind => `${BODY_SECTIONS[kind]}:\n${bodies[`${kind}_body`]}${bodies[`${kind}_body_truncated`] ? '\n\n[truncated]' : ''}`);
+}
+// activityErrorBox renders a failure as the same red box the attempt rows use
+// (model name + status, click for details). Every Activity error surface goes
+// through here — a request-level failure, the mobile card footer, and a failed
+// attempt-detail load — so no error is ever shown as bare red text.
+function activityErrorBox({ route, status = 'failed', summary, detail, hover, extra = '' }) {
+  const text = summary || detail?.body || 'Request failed';
+  const title = hover ? ` title="${h(hover)}"` : '';
+  const keyAttr = detail ? ` data-error-key="${registerErrorDetail(detail)}"` : '';
+  return `<div class="activity-attempt attempt-failed activity-error-box"${keyAttr}${title}><span class="attempt-route"><code class="model-id" title="${h(route)}">${h(route)}</code><span class="attempt-error-summary">${h(text)}</span></span><span class="attempt-status">${h(status)}</span>${extra}</div>`;
+}
+// requestErrorDetail builds the click-through payload for a request-level
+// failure from the Activity row itself (its attempts were never rendered as a
+// red box, so the row is the only source of the message).
+function requestErrorDetail(row) {
+  const route = errorRouteLabel(row.resolved_provider, row.resolved_model, row.requested_model);
+  const status = row.http_status ? `HTTP ${row.http_status}` : 'failed';
+  const parts = [];
+  parts.push(`Error: ${row.error_text}${row.error_message ? ` — ${row.error_message}` : ''}`);
+  if (row.http_status) parts.push(`HTTP status: ${row.http_status}`);
+  if (row.latency_ms) parts.push(`Latency: ${row.latency_ms} ms`);
+  if (row.client_request_id) parts.push(`Request ID: ${row.client_request_id}`);
+  return { title: `${route} · ${status}`, body: parts.join('\n\n'), lazy: lazyBodies(row, ['error', 'request', 'response']) };
+}
+// requestErrorHTML is the red box for a failed request whose attempt rows were
+// not rendered, plus any request-level error the attempt rows cannot carry.
+// The mobile card carries this box in its footer, so its detail body never
+// repeats it — a failure is shown exactly once per card.
+function requestErrorHTML(row, kind) {
+  if (kind === 'card' || !row.error_text) return '';
+  const route = errorRouteLabel(row.resolved_provider, row.resolved_model, row.requested_model);
+  const summary = errorClassSummary(row.error_text);
+  const hover = [row.error_text, row.error_message, row.latency_ms ? `Latency: ${row.latency_ms} ms` : ''].filter(Boolean).join(' · ');
+  return `<div class="attempt-sequence">${activityErrorBox({ route, summary, detail: requestErrorDetail(row), hover })}</div>`;
+}
+
 // activityDetailHTML is the shared "Resolved" cell / card-detail body. The full
 // attempt list is rendered here once row.attempts has been backfilled, so both
-// the table and the mobile card surface stay identical.
+// the table and the mobile card surface stay identical. Every failure renders as
+// a red error box (never bare red text) with the full detail one click away.
 function activityDetailHTML(row, kind) {
-  const fixedAttempt = row.resolved_provider ? { provider: row.resolved_provider, model: row.resolved_model || '', failure_class: row.error_text, latency_ms: row.latency_ms, http_status: row.http_status, error_message: row.error_message, error_body: row.error_body, error_body_truncated: row.error_body_truncated, request_body: row.request_body, request_body_truncated: row.request_body_truncated, result: row.http_status >= 200 && row.http_status < 300 ? 'success' : 'failed' } : null;
-  const resolved = row.fallback_used ? '' : fixedAttempt ? (row.attempt_rows > 1 ? '' : `<div class="attempt-sequence">${activityAttemptDetails(fixedAttempt, 0)}</div>`) : '';
-  const sequence = (row.fallback_used || !fixedAttempt || row.attempt_rows > 1) ? attemptSequence(row) : '';
-  const errorHover = [row.error_message, row.latency_ms ? `Latency: ${row.latency_ms} ms` : ''].filter(Boolean).join(' · ');
-  const error = sequence ? '' : (row.error_text ? `<span class="error-text"${errorHover ? ` title="${h(errorHover)}"` : ''}>${h(row.error_text)}</span>` : '');
-  const loadError = row.attemptsError ? `<span class="error-text activity-attempts-error">${h(row.attemptsError)}</span><button type="button" class="activity-retry" data-activity-retry="${h(row.id)}">Retry</button>` : '';
+  const fixedAttempt = row.resolved_provider ? { provider: row.resolved_provider, model: row.resolved_model || '', failure_class: row.error_text, latency_ms: row.latency_ms, http_status: row.http_status, error_message: row.error_message, lazy: { row, want: ['error', 'request', 'response'] }, result: row.http_status >= 200 && row.http_status < 300 ? 'success' : 'failed' } : null;
+  // A single failed attempt is already its own red box; anything else (fallback
+  // chains, pre-attempt failures) renders the attempt rows plus a request-level
+  // box so the request's own outcome is never dropped.
+  const singleAttempt = !row.fallback_used && fixedAttempt && row.attempt_rows <= 1;
+  const showResolved = kind === 'table' || fixedAttempt?.result === 'success' || !row.error_text;
+  const previewFallback = row.fallback_used && !row.attempts?.length && fixedAttempt?.result === 'success' &&
+    (row.has_request_body || row.has_response_body);
+  const resolved = showResolved && (singleAttempt || previewFallback) ? `<div class="attempt-sequence">${activityAttemptDetails(fixedAttempt, previewFallback ? Math.max(0, (row.attempt_rows || 1) - 1) : 0)}</div>` : '';
+  const sequence = singleAttempt ? '' : attemptSequence(row);
+  const error = singleAttempt ? '' : requestErrorHTML(row, kind);
+  const loadError = row.attemptsError ? `<div class="attempt-sequence">${activityErrorBox({ route: errorRouteLabel(row.resolved_provider, row.resolved_model, row.requested_model), status: 'details', summary: row.attemptsError, extra: `<button type="button" class="activity-retry" data-activity-retry="${h(row.id)}">Retry</button>` })}</div>` : '';
   const pending = activityNeedsAttempts(row) ? '<span class="activity-detail-pending" aria-hidden="true">…</span>' : '';
-  // The mobile card already shows error_text in its footer, so its detail body
-  // only carries the hydrated attempt sequence (plus load errors / retry).
-  const parts = kind === 'card' ? [sequence] : [resolved, sequence, error];
   const reasoning = row.reasoning_stripped ? '<span class="activity-reasoning-warning" title="Unverifiable reasoning history was omitted during protocol translation.">Reasoning history omitted</span>' : '';
-  return `${parts.join('')}${reasoning}${loadError}${pending}`;
+  return `${resolved}${sequence}${error}${reasoning}${loadError}${pending}`;
 }
 function resolvedActivity(row) { return activityDetailHTML(row, 'table'); }
 function activityCardDetail(row) { return activityDetailHTML(row, 'card') + `<div class="history-meta">${rowCache(row)}</div>`; }
@@ -2696,11 +2834,14 @@ function createActivityFeed(options) {
     });
   }
   function patch(row) {
-    containers().forEach(container => {
-      if (!container) return;
-      $$('[data-activity-resolved]', container).forEach(el => {
-        if (el.dataset.activityResolved !== row.id) return;
-        el.innerHTML = el.dataset.activityDetailKind === 'card' ? activityCardDetail(row) : resolvedActivity(row);
+    options.errors.run(() => {
+      containers().forEach(container => {
+        if (!container) return;
+        $$('[data-activity-resolved]', container).forEach(el => {
+          if (el.dataset.activityResolved !== row.id) return;
+          removeErrorDetails(el, options.errors.details);
+          el.innerHTML = el.dataset.activityDetailKind === 'card' ? activityCardDetail(row) : resolvedActivity(row);
+        });
       });
     });
   }
@@ -2785,8 +2926,10 @@ function activityFeedURL(kind, client, modelID, offset, limit, search) {
   const base = kind === 'client' ? `/api/admin/client-keys/${client.id}/activity` : kind === 'real' ? `/api/admin/models/${modelID}/activity` : `/api/admin/virtual-models/${modelID}/activity`;
   return `${base}?limit=${limit + 1}&offset=${offset}&search=${encodeURIComponent(search || '')}`;
 }
-function renderActivity(state) { errorDetails.clear(); errorDetailSeq = 0; const showClient = !state.client; $('#activity-client-head').hidden = !showClient; $('#activity-empty').hidden = state.loading || state.rows.length > 0; $('#activity-body').innerHTML = state.loading ? '<tr><td colspan="8"><span class="meta-line">Loading activity…</span></td></tr>' : state.rows.map(row => activityTableRow(row, showClient)).join(''); $('#activity-mobile-body').innerHTML = state.loading ? '<p class="meta-line">Loading activity…</p>' : state.rows.map(row => activityHistoryCard(row, showClient)).join(''); updateActivityCount(state, '#activity-count'); }
-function appendActivity(state, page) { const showClient = !state.client; const table = $('#activity-body'); const cards = $('#activity-mobile-body'); page.forEach(row => { table.insertAdjacentHTML('beforeend', activityTableRow(row, showClient)); cards.insertAdjacentHTML('beforeend', activityHistoryCard(row, showClient)); }); $('#activity-empty').hidden = state.rows.length > 0; updateActivityCount(state, '#activity-count'); }
+function renderActivity(state) { return dialogErrors.run(() => renderActivityInner(state)); }
+function renderActivityInner(state) { dialogErrors.clear(); const showClient = !state.client; $('#activity-client-head').hidden = !showClient; $('#activity-empty').hidden = state.loading || state.rows.length > 0; $('#activity-body').innerHTML = state.loading ? '<tr><td colspan="8"><span class="meta-line">Loading activity…</span></td></tr>' : state.rows.map(row => activityTableRow(row, showClient)).join(''); $('#activity-mobile-body').innerHTML = state.loading ? '<p class="meta-line">Loading activity…</p>' : state.rows.map(row => activityHistoryCard(row, showClient)).join(''); updateActivityCount(state, '#activity-count'); }
+function appendActivity(state, page) { return dialogErrors.run(() => appendActivityInner(state, page)); }
+function appendActivityInner(state, page) { const showClient = !state.client; const table = $('#activity-body'); const cards = $('#activity-mobile-body'); page.forEach(row => { table.insertAdjacentHTML('beforeend', activityTableRow(row, showClient)); cards.insertAdjacentHTML('beforeend', activityHistoryCard(row, showClient)); }); $('#activity-empty').hidden = state.rows.length > 0; updateActivityCount(state, '#activity-count'); }
 const activityFeed = createActivityFeed({
   state: activityState,
   containers: () => [$('#activity-body'), $('#activity-mobile-body')],
@@ -2794,6 +2937,7 @@ const activityFeed = createActivityFeed({
   resetScroll: resetActivityScroll,
   showError: message => { $('#activity-error').textContent = message; },
   fetch: (offset, limit, search, signal) => api(activityFeedURL(activityState.kind, activityState.client, activityState.modelID, offset, limit, search), { signal }),
+  errors: dialogErrors,
   render: renderActivity,
   append: appendActivity,
 });
@@ -2829,31 +2973,27 @@ function activityAttemptDetails(attempt, index) {
   else cls = 'attempt-neutral';
   let clickAttr = '';
   let hoverAttr = '';
+  const lazy = attempt.lazy ? lazyBodies(attempt.lazy.row, attempt.lazy.want) : null;
   if (attempt.result === 'failed') {
-    const key = ++errorDetailSeq;
     const parts = [];
     if (attempt.error_message) parts.push(attempt.error_message);
     if (attempt.failure_class) parts.push(`Resolver: ${attempt.failure_class}`);
     if (attempt.error_body) parts.push(`Provider error body:\n${attempt.error_body}${attempt.error_body_truncated ? '\n\n[truncated]' : ''}`);
-    if (attempt.request_body) parts.push(`Client request body:\n${attempt.request_body}${attempt.request_body_truncated ? '\n\n[truncated]' : ''}`);
     if (attempt.latency_ms) parts.push(`Latency: ${attempt.latency_ms} ms`);
-    errorDetails.set(key, { title: `${route} · ${status}`, body: parts.join('\n\n') || '(no error details)' });
-    clickAttr = ` data-error-key="${key}"`;
+    clickAttr = ` data-error-key="${registerErrorDetail({ title: `${route} · ${status}`, body: parts.join('\n\n') || (lazy ? '' : '(no error details)'), lazy })}"`;
     const hover = [attempt.error_message, attempt.latency_ms ? `Latency: ${attempt.latency_ms} ms` : ''].filter(Boolean).join(' · ');
     if (hover) hoverAttr = ` title="${h(hover)}"`;
+  } else if (attempt.result === 'success' && lazy) {
+    clickAttr = ` data-error-key="${registerErrorDetail({ title: `${route} · ${status}`, body: '', lazy })}"`;
   } else if (isCooldown) {
-    const key = ++errorDetailSeq;
-    errorDetails.set(key, { cooldown: { provider: attempt.provider, model: attempt.model, created_at: attempt.created_at }, title: `${route} · cooldown` });
-    clickAttr = ` data-error-key="${key}"`;
+    clickAttr = ` data-error-key="${registerErrorDetail({ cooldown: { provider: attempt.provider, model: attempt.model, created_at: attempt.created_at }, title: `${route} · cooldown` })}"`;
     hoverAttr = ` title="${h('Cooldown — click for details')}"`;
   } else if (isSkipped) {
-    const key = ++errorDetailSeq;
     const parts = [];
     if (attempt.error_message) parts.push(attempt.error_message);
     if (attempt.failure_class) parts.push(`Resolver: ${attempt.failure_class}`);
     if (attempt.latency_ms) parts.push(`Latency: ${attempt.latency_ms} ms`);
-    errorDetails.set(key, { title: `${route} · skipped`, body: parts.join('\n\n') || 'The target was skipped before an upstream request was made.' });
-    clickAttr = ` data-error-key="${key}"`;
+    clickAttr = ` data-error-key="${registerErrorDetail({ title: `${route} · skipped`, body: parts.join('\n\n') || 'The target was skipped before an upstream request was made.' })}"`;
     hoverAttr = ` title="${h('Skipped — click for details')}"`;
   }
   return `<div class="activity-attempt ${cls}"${clickAttr}${hoverAttr}><span class="attempt-number">${String(index + 1).padStart(2, '0')}</span><span class="attempt-route"><code title="${h(route)}">${h(route)}</code></span><span class="attempt-status">${status}</span></div>`;
@@ -2862,15 +3002,18 @@ function activityAttemptDetails(attempt, index) {
 // Full error text for failed attempts. The complete string lives here keyed by
 // the data-error-key rendered above, and is shown in #error-dialog on click. The
 // store is rebuilt on every activity render so keys never go stale.
-let errorDetailSeq = 0;
-const errorDetails = new Map();
+let errorOpenToken = 0;
 let cooldownTickId = null;
 function clearCooldownTick() { if (cooldownTickId !== null) { clearInterval(cooldownTickId); cooldownTickId = null; } }
 function fmtDuration(totalSeconds) { if (totalSeconds <= 0) return '0s'; const s = Math.floor(totalSeconds); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60; if (h > 0) return `${h}h ${m}m ${sec}s`; if (m > 0) return `${m}m ${sec}s`; return `${sec}s`; }
-function openErrorDetail(key) { const detail = errorDetails.get(Number(key)); if (!detail) return; clearCooldownTick(); if (detail.cooldown) { const route = `${detail.cooldown.provider}/${detail.cooldown.model}`; $('#error-title').textContent = detail.title; $('#copy-error').hidden = !(window.isSecureContext && navigator.clipboard?.writeText); $('#clear-cooldown').hidden = false; $('#error-dialog').showModal();
+function openErrorDetail(key) { const detail = errorScopes.get(key.split(':', 1)[0])?.get(key); if (!detail) return; clearCooldownTick(); const openToken = ++errorOpenToken;
+  const retryBodies = $('#retry-error-bodies');
+  retryBodies.hidden = true;
+  retryBodies.onclick = null;
+  if (detail.cooldown) { const route = `${detail.cooldown.provider}/${detail.cooldown.model}`; $('#error-title').textContent = detail.title; $('#copy-error').hidden = !(window.isSecureContext && navigator.clipboard?.writeText); $('#clear-cooldown').hidden = false; $('#error-dialog').showModal();
   const bodyEl = $('#error-body'); $('#error-copy-state').textContent = '';
   bodyEl.textContent = 'Checking cooldown state…';
-  const setBody = state => bodyEl.textContent = state;
+  const setBody = state => { if (openToken === errorOpenToken) bodyEl.textContent = state; };
   const renderCooling = cool => {
     const ago = cool.ago_seconds + ((Date.now() - cool.fetchedAt) / 1000);
     const rest = cool.restored_in_seconds - ((Date.now() - cool.fetchedAt) / 1000);
@@ -2889,27 +3032,60 @@ function openErrorDetail(key) { const detail = errorDetails.get(Number(key)); if
     setBody(lines.join('\n\n'));
   };
   const loadStatus = async () => {
-    try { const res = await api(`/api/admin/cooldown?provider=${encodeURIComponent(detail.cooldown.provider)}&model=${encodeURIComponent(detail.cooldown.model)}`); const cool = { ...res, fetchedAt: Date.now() }; if (cool.cooling) { renderCooling(cool); clearCooldownTick(); cooldownTickId = setInterval(() => renderCooling(cool), 1000); } else { renderExpired(); } } catch (error) { setBody('Could not load cooldown state: ' + errorMessage(error)); }
+    try { const res = await api(`/api/admin/cooldown?provider=${encodeURIComponent(detail.cooldown.provider)}&model=${encodeURIComponent(detail.cooldown.model)}`); if (openToken !== errorOpenToken) return; const cool = { ...res, fetchedAt: Date.now() }; if (cool.cooling) { renderCooling(cool); clearCooldownTick(); cooldownTickId = setInterval(() => renderCooling(cool), 1000); } else { renderExpired(); } } catch (error) { setBody('Could not load cooldown state: ' + errorMessage(error)); }
   };
   $('#clear-cooldown').onclick = async () => { const button = $('#clear-cooldown'); button.disabled = true; try { await api(`/api/admin/cooldown?provider=${encodeURIComponent(detail.cooldown.provider)}&model=${encodeURIComponent(detail.cooldown.model)}`, { method: 'DELETE' }); clearCooldownTick(); renderExpired(); } catch (error) { setBody('Could not clear cooldown: ' + errorMessage(error)); } finally { button.disabled = false; } };
   loadStatus();
   return; }
-  $('#error-title').textContent = detail.title; $('#error-body').textContent = detail.body; $('#error-copy-state').textContent = ''; $('#copy-error').hidden = !(window.isSecureContext && navigator.clipboard?.writeText); $('#clear-cooldown').hidden = true; $('#error-dialog').showModal(); }
+  const lazy = detail.lazy;
+  const body = $('#error-body');
+  const compose = extra => [detail.body, ...extra].filter(Boolean).join('\n\n');
+  $('#error-title').textContent = detail.title;
+  body.textContent = lazy?.row.bodies ? compose(bodySections(lazy.row.bodies, lazy.want)) : detail.body;
+  $('#error-copy-state').textContent = '';
+  $('#copy-error').hidden = !(window.isSecureContext && navigator.clipboard?.writeText);
+  $('#clear-cooldown').hidden = true;
+  $('#error-dialog').showModal();
+  if (!lazy || lazy.row.bodies) return;
+
+  async function loadBodies() {
+    retryBodies.hidden = true;
+    body.textContent = compose(['Loading message bodies…']);
+    try {
+      const bodies = await api(`/api/admin/activity/${encodeURIComponent(lazy.row.id)}/bodies`);
+      lazy.row.bodies = bodies;
+      if (openToken === errorOpenToken) body.textContent = compose(bodySections(bodies, lazy.want));
+    } catch (error) {
+      if (openToken !== errorOpenToken) return;
+      body.textContent = compose([`Could not load message bodies: ${errorMessage(error)}`]);
+      retryBodies.hidden = false;
+    }
+  }
+  retryBodies.onclick = loadBodies;
+  loadBodies();
+}
 document.addEventListener('click', event => { const target = event.target.closest('[data-error-key]'); if (target) openErrorDetail(target.dataset.errorKey); });
 $('#copy-error').onclick = async () => { const text = $('#error-body').textContent; const state = $('#error-copy-state'); if (!(window.isSecureContext && navigator.clipboard?.writeText)) return; try { await navigator.clipboard.writeText(text); state.textContent = 'Copied to clipboard.'; } catch { state.textContent = 'Clipboard copy was denied — select the text and press Ctrl/Cmd+C.'; } };
-$('#close-error').onclick = $('#done-error').onclick = () => { clearCooldownTick(); $('#error-dialog').close(); };
-  function attemptSequence(row) { if (!row.attempts?.length) return ''; return `<div class="attempt-sequence">${row.attempts.map((attempt, index) => activityAttemptDetails(index === 0 ? { ...attempt, request_body: row.request_body, request_body_truncated: row.request_body_truncated } : attempt, index)).join('')}</div>`; }
+$('#close-error').onclick = $('#done-error').onclick = () => $('#error-dialog').close();
+$('#error-dialog').addEventListener('close', () => {
+  if ($('#error-dialog').open) return;
+  errorOpenToken++;
+  clearCooldownTick();
+  $('#error-body').textContent = '';
+  $('#retry-error-bodies').onclick = null;
+});
+  function attemptSequence(row) { if (!row.attempts?.length) return ''; return `<div class="attempt-sequence">${row.attempts.map((attempt, index) => activityAttemptDetails({ ...attempt, lazy: { row, want: attempt.result === 'success' ? ['request', 'response'] : index === 0 ? ['request'] : [] } }, index)).join('')}</div>`; }
  function requestIdentity(row) { const requestedModel = h(row.requested_model); const requestedTitle = h(row.requested_model); if (row.exposed_model && row.exposed_model !== row.requested_model) { return `<code class="model-id activity-requested-model" title="${requestedTitle}">${requestedModel}</code><br><span class="meta-line activity-exposed-model" title="${h(row.exposed_model)}">map &gt; ${h(row.exposed_model)}</span>`; } return `<code class="model-id activity-requested-model" title="${requestedTitle}">${requestedModel}</code>`; }
 function activityRequestID(row) { const id = row.client_request_id || ''; const short = id.length > 8 ? `${id.slice(0, 8)}…` : id; const copyable = id && (window.isSecureContext && navigator.clipboard?.writeText); const attrs = copyable ? ` data-copy-request-id="${h(id)}" role="button" tabindex="0" aria-label="Copy request ID ${h(id)}"` : ''; return `<code class="model-id activity-request-id"${attrs} title="${h(id)}">${h(short)}</code>`; }
 async function copyRequestID(button) { const id = button.dataset.copyRequestId; if (!id) return; if (!(window.isSecureContext && navigator.clipboard?.writeText)) return; try { await navigator.clipboard.writeText(id); const original = button.textContent; button.classList.add('copied'); button.textContent = 'Copied'; setTimeout(() => { button.classList.remove('copied'); button.textContent = original; }, 1200); } catch { const range = document.createRange(); range.selectNodeContents(button); const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range); button.title = 'Press Ctrl/Cmd+C to copy'; } }
 document.addEventListener('click', event => { const target = event.target.closest('[data-copy-request-id]'); if (target) copyRequestID(target); });
 document.addEventListener('keydown', event => { if (event.key !== 'Enter' && event.key !== ' ') return; const target = event.target.closest('[data-copy-request-id]'); if (!target) return; event.preventDefault(); copyRequestID(target); });
- function activityHistoryCard(row, showClient = true) {
+function activityHistoryCard(row, showClient = true) {
   const status = row.http_status >= 200 && row.http_status < 300 ? 'Succeeded' : `HTTP ${row.http_status || 'error'}`;
   const statusClass = row.http_status >= 200 && row.http_status < 300 ? 'history-success' : 'history-failure';
   const resolved = row.resolved_provider && row.resolved_model ? `${row.resolved_provider}/${row.resolved_model}` : 'No resolved target';
   // Shared detail renderer below includes the request's accounting.
-   return `<article class="history-card" data-activity-row="${h(row.id)}"><div class="history-card-head"><span class="history-status ${statusClass}">${h(status)}</span><time>${h(date(row.created_at))}</time></div>${showClient ? `<strong class="history-client">${h(row.client_name || '')}</strong>` : ''}<div class="history-route"><code>${h(row.requested_model)}</code>${row.exposed_model && row.exposed_model !== row.requested_model ? `<small>map → ${h(row.exposed_model)}</small>` : ''}</div><div class="history-resolution"><span>Resolved</span><strong>${h(resolved)}</strong></div><div class="history-meta"><span>${h(row.protocol)}${row.streaming ? ' · stream' : ''}</span><span>${h(row.latency_ms)} ms</span><span>${row.fallback_used ? 'Fallback' : 'Direct'}</span></div><div data-activity-resolved="${h(row.id)}" data-activity-detail-kind="card">${activityCardDetail(row)}</div><div class="history-footer"><span>${activityRequestID(row)}</span>${row.error_text ? `<span class="error-text">${h(row.error_text)}</span>` : ''}</div></article>`;
+   return `<article class="history-card" data-activity-row="${h(row.id)}"><div class="history-card-head"><span class="history-status ${statusClass}">${h(status)}</span><time>${h(date(row.created_at))}</time></div>${showClient ? `<strong class="history-client">${h(row.client_name || '')}</strong>` : ''}<div class="history-route"><code>${h(row.requested_model)}</code>${row.exposed_model && row.exposed_model !== row.requested_model ? `<small>map → ${h(row.exposed_model)}</small>` : ''}</div><div class="history-resolution"><span>Resolved</span><strong>${h(resolved)}</strong></div><div class="history-meta"><span>${h(row.protocol)}${row.streaming ? ' · stream' : ''}</span><span>${h(row.latency_ms)} ms</span><span>${row.fallback_used ? 'Fallback' : 'Direct'}</span></div><div data-activity-resolved="${h(row.id)}" data-activity-detail-kind="card">${activityCardDetail(row)}</div><div class="history-footer"><span>${activityRequestID(row)}</span>${row.error_text ? `<div class="history-error">${requestErrorHTML(row, 'table')}</div>` : ''}</div></article>`;
 }
  filterInput('#activity-search', value => { activityFeed.setSearch(value); });
 $('#close-activity').onclick = $('#done-activity').onclick = () => $('#activity-dialog').close();
@@ -2940,7 +3116,7 @@ $('#export-activity').onclick = () => openExportDialog({ kind: activityState.kin
 $('#export-global-activity').onclick = () => openExportDialog({ kind: '', client: null, modelID: '', search: globalActivityState.search });
 $('#clear-activity').onclick = async () => {
   if (activityState.kind !== 'client' || !activityState.client) return;
-  if (!await confirmAction({ title: `Clear ${activityState.client.name} activity?`, copy: 'All recorded request metadata for this client will be permanently deleted.', action: 'Clear activity' })) return;
+  if (!await confirmAction({ title: `Clear ${activityState.client.name} activity?`, copy: 'All recorded Activity for this client, including any captured message bodies, will be permanently deleted.', action: 'Clear activity' })) return;
   const button = $('#clear-activity'); button.disabled = true; $('#activity-error').textContent = '';
   try {
     await api(`/api/admin/client-keys/${activityState.client.id}/activity`, { method: 'DELETE' });
@@ -2976,8 +3152,10 @@ $('#export-custom').onclick = () => {
 // hydration) so fallbacks appear identically — the extra Client column is the
 // only difference.
 const globalActivityState = { rows: [], offset: 0, limit: ACTIVITY_PAGE_SIZE, search: '', hasMore: true, loading: false };
-function renderGlobalActivity(state) { errorDetails.clear(); errorDetailSeq = 0; $('#global-activity-empty').hidden = state.loading || state.rows.length > 0; $('#global-activity-empty-mobile').hidden = state.loading || state.rows.length > 0; $('#global-activity-body').innerHTML = state.loading ? '<tr><td colspan="8"><span class="meta-line">Loading activity…</span></td></tr>' : state.rows.map(row => activityTableRow(row, true)).join(''); $('#global-activity-cards').innerHTML = state.loading ? '<p class="meta-line">Loading activity…</p>' : state.rows.map(row => activityHistoryCard(row, true)).join(''); updateActivityCount(state, '#global-activity-count'); }
-function appendGlobalActivity(state, page) { const table = $('#global-activity-body'); const cards = $('#global-activity-cards'); page.forEach(row => { table.insertAdjacentHTML('beforeend', activityTableRow(row, true)); cards.insertAdjacentHTML('beforeend', activityHistoryCard(row, true)); }); $('#global-activity-empty').hidden = state.rows.length > 0; $('#global-activity-empty-mobile').hidden = state.rows.length > 0; updateActivityCount(state, '#global-activity-count'); }
+function renderGlobalActivity(state) { return globalErrors.run(() => renderGlobalActivityInner(state)); }
+function renderGlobalActivityInner(state) { globalErrors.clear(); $('#global-activity-empty').hidden = state.loading || state.rows.length > 0; $('#global-activity-empty-mobile').hidden = state.loading || state.rows.length > 0; $('#global-activity-body').innerHTML = state.loading ? '<tr><td colspan="8"><span class="meta-line">Loading activity…</span></td></tr>' : state.rows.map(row => activityTableRow(row, true)).join(''); $('#global-activity-cards').innerHTML = state.loading ? '<p class="meta-line">Loading activity…</p>' : state.rows.map(row => activityHistoryCard(row, true)).join(''); updateActivityCount(state, '#global-activity-count'); }
+function appendGlobalActivity(state, page) { return globalErrors.run(() => appendGlobalActivityInner(state, page)); }
+function appendGlobalActivityInner(state, page) { const table = $('#global-activity-body'); const cards = $('#global-activity-cards'); page.forEach(row => { table.insertAdjacentHTML('beforeend', activityTableRow(row, true)); cards.insertAdjacentHTML('beforeend', activityHistoryCard(row, true)); }); $('#global-activity-empty').hidden = state.rows.length > 0; $('#global-activity-empty-mobile').hidden = state.rows.length > 0; updateActivityCount(state, '#global-activity-count'); }
 const globalActivityFeed = createActivityFeed({
   state: globalActivityState,
   containers: () => [$('#global-activity-body'), $('#global-activity-cards')],
@@ -2990,6 +3168,7 @@ const globalActivityFeed = createActivityFeed({
   resetScroll: () => { const shell = $('#global-activity-body').closest('.activity-table-shell'); if (shell) shell.scrollTop = 0; },
   showError: message => { $('#global-activity-error').textContent = message; },
   fetch: (offset, limit, search, signal) => api(`/api/admin/activity?limit=${limit + 1}&offset=${offset}&search=${encodeURIComponent(search || '')}`, { signal }),
+  errors: globalErrors,
   render: renderGlobalActivity,
   append: appendGlobalActivity,
 });
@@ -3005,11 +3184,12 @@ async function loadSettings() {
   const token = ++state.loadToken;
   const settings = await api('/api/admin/settings');
   if (token !== state.loadToken) return;
-  $('[name="default_logging_enabled"]', $('#settings-form')).checked = settings.default_logging_enabled; $('[name="log_error_bodies"]', $('#settings-form')).checked = settings.log_error_bodies; $('[name="default_retention_days"]', $('#settings-form')).value = settings.default_retention_days; $('[name="fallback_timeout_seconds"]', $('#fallback-form')).value = settings.fallback_timeout_seconds; $('[name="fallback_cooldown_seconds"]', $('#fallback-form')).value = settings.fallback_cooldown_seconds; const nf = $('#notifications-form'); $('[name="notifications_enabled"]', nf).checked = settings.notifications_enabled; $('[name="notifications_webhook_url"]', nf).value = settings.notifications_webhook_url || ''; $('[name="notifications_event_fallback"]', nf).checked = settings.notifications_event_fallback; $('[name="notifications_event_all_failed"]', nf).checked = settings.notifications_event_all_failed; $('[name="notifications_event_client_key_created"]', nf).checked = settings.notifications_event_client_key_created; $('[name="notifications_event_client_key_deleted"]', nf).checked = settings.notifications_event_client_key_deleted; $('[name="notifications_event_admin_login"]', nf).checked = settings.notifications_event_admin_login; const cooldownInput = $('[name="notifications_cooldown_seconds"]', nf); cooldownInput.value = settings.notifications_cooldown_seconds; const authInput = $('[name="notifications_auth_header"]', nf); authInput.value = ''; authInput.placeholder = settings.notifications_auth_header_set ? '•••••••• (set — leave blank to keep)' : 'Optional, e.g. Bearer <token>'; $('#notifications-auth-note').textContent = settings.notifications_auth_header_set ? 'An Authorization header is configured. Leave blank to keep it; type a new value to replace it.' : ''; $('#clear-notifications-auth').hidden = !settings.notifications_auth_header_set; authHeaderDirty = false; authHeaderClear = false;
+  $('[name="default_logging_enabled"]', $('#settings-form')).checked = settings.default_logging_enabled; $('[name="log_error_bodies"]', $('#settings-form')).checked = settings.log_error_bodies; $('[name="log_all_bodies"]', $('#settings-form')).checked = settings.log_all_bodies; $('[name="default_retention_days"]', $('#settings-form')).value = settings.default_retention_days; $('[name="fallback_timeout_seconds"]', $('#fallback-form')).value = settings.fallback_timeout_seconds; $('[name="fallback_cooldown_seconds"]', $('#fallback-form')).value = settings.fallback_cooldown_seconds; const nf = $('#notifications-form'); $('[name="notifications_enabled"]', nf).checked = settings.notifications_enabled; $('[name="notifications_webhook_url"]', nf).value = settings.notifications_webhook_url || ''; $('[name="notifications_event_fallback"]', nf).checked = settings.notifications_event_fallback; $('[name="notifications_event_all_failed"]', nf).checked = settings.notifications_event_all_failed; $('[name="notifications_event_client_key_created"]', nf).checked = settings.notifications_event_client_key_created; $('[name="notifications_event_client_key_deleted"]', nf).checked = settings.notifications_event_client_key_deleted; $('[name="notifications_event_admin_login"]', nf).checked = settings.notifications_event_admin_login; const cooldownInput = $('[name="notifications_cooldown_seconds"]', nf); cooldownInput.value = settings.notifications_cooldown_seconds; const authInput = $('[name="notifications_auth_header"]', nf); authInput.value = ''; authInput.placeholder = settings.notifications_auth_header_set ? '•••••••• (set — leave blank to keep)' : 'Optional, e.g. Bearer <token>'; $('#notifications-auth-note').textContent = settings.notifications_auth_header_set ? 'An Authorization header is configured. Leave blank to keep it; type a new value to replace it.' : ''; $('#clear-notifications-auth').hidden = !settings.notifications_auth_header_set; authHeaderDirty = false; authHeaderClear = false;
 }
-async function saveSettings() { const settingsForm = $('#settings-form'), fallbackForm = $('#fallback-form'), notificationsForm = $('#notifications-form'); if (!settingsForm.reportValidity() || !fallbackForm.reportValidity() || !notificationsForm.reportValidity()) return; const settingsValues = new FormData(settingsForm), fallbackValues = new FormData(fallbackForm), notificationsValues = new FormData(notificationsForm); const buttons = [$('#save-settings-bottom')]; buttons.forEach(b => b.disabled = true); $('#settings-error').textContent = ''; $('#fallback-error').textContent = ''; $('#notifications-error').textContent = '';   const body = { default_logging_enabled: settingsValues.get('default_logging_enabled') === 'on', default_retention_days: Number(settingsValues.get('default_retention_days')), log_error_bodies: settingsValues.get('log_error_bodies') === 'on', fallback_timeout_seconds: Number(fallbackValues.get('fallback_timeout_seconds')), fallback_cooldown_seconds: Number(fallbackValues.get('fallback_cooldown_seconds')), notifications_enabled: notificationsValues.get('notifications_enabled') === 'on', notifications_webhook_url: notificationsValues.get('notifications_webhook_url') || '', notifications_event_fallback: notificationsValues.get('notifications_event_fallback') === 'on', notifications_event_all_failed: notificationsValues.get('notifications_event_all_failed') === 'on', notifications_event_client_key_created: notificationsValues.get('notifications_event_client_key_created') === 'on', notifications_event_client_key_deleted: notificationsValues.get('notifications_event_client_key_deleted') === 'on', notifications_cooldown_seconds: Number(notificationsValues.get('notifications_cooldown_seconds')) }; if (runtimeMode !== 'hosted') { body.notifications_event_admin_login = notificationsValues.get('notifications_event_admin_login') === 'on'; } if (authHeaderDirty) body.notifications_auth_header = notificationsValues.get('notifications_auth_header') || ''; if (authHeaderClear) body.notifications_auth_header = ''; try { await api('/api/admin/settings', { method: 'PUT', body: JSON.stringify(body) }); authHeaderDirty = false; authHeaderClear = false; flash('Settings saved.'); await loadSettings(); } catch (error) { const message = errorMessage(error); $('#settings-error').textContent = message; $('#fallback-error').textContent = message; $('#notifications-error').textContent = message; } finally { buttons.forEach(b => b.disabled = false); } }
+async function saveSettings() { const settingsForm = $('#settings-form'), fallbackForm = $('#fallback-form'), notificationsForm = $('#notifications-form'); if (!settingsForm.reportValidity() || !fallbackForm.reportValidity() || !notificationsForm.reportValidity()) return; const settingsValues = new FormData(settingsForm), fallbackValues = new FormData(fallbackForm), notificationsValues = new FormData(notificationsForm); const buttons = [$('#save-settings-bottom')]; buttons.forEach(b => b.disabled = true); $('#settings-error').textContent = ''; $('#fallback-error').textContent = ''; $('#notifications-error').textContent = '';   const body = { default_logging_enabled: settingsValues.get('default_logging_enabled') === 'on', default_retention_days: Number(settingsValues.get('default_retention_days')), log_error_bodies: settingsValues.get('log_error_bodies') === 'on', log_all_bodies: settingsValues.get('log_all_bodies') === 'on', fallback_timeout_seconds: Number(fallbackValues.get('fallback_timeout_seconds')), fallback_cooldown_seconds: Number(fallbackValues.get('fallback_cooldown_seconds')), notifications_enabled: notificationsValues.get('notifications_enabled') === 'on', notifications_webhook_url: notificationsValues.get('notifications_webhook_url') || '', notifications_event_fallback: notificationsValues.get('notifications_event_fallback') === 'on', notifications_event_all_failed: notificationsValues.get('notifications_event_all_failed') === 'on', notifications_event_client_key_created: notificationsValues.get('notifications_event_client_key_created') === 'on', notifications_event_client_key_deleted: notificationsValues.get('notifications_event_client_key_deleted') === 'on', notifications_cooldown_seconds: Number(notificationsValues.get('notifications_cooldown_seconds')) }; if (runtimeMode !== 'hosted') { body.notifications_event_admin_login = notificationsValues.get('notifications_event_admin_login') === 'on'; } if (authHeaderDirty) body.notifications_auth_header = notificationsValues.get('notifications_auth_header') || ''; if (authHeaderClear) body.notifications_auth_header = ''; try { await api('/api/admin/settings', { method: 'PUT', body: JSON.stringify(body) }); authHeaderDirty = false; authHeaderClear = false; flash('Settings saved.'); await loadSettings(); } catch (error) { const message = errorMessage(error); $('#settings-error').textContent = message; $('#fallback-error').textContent = message; $('#notifications-error').textContent = message; } finally { buttons.forEach(b => b.disabled = false); } }
 $('#save-settings-bottom').addEventListener('click', saveSettings);
 $('[name="log_error_bodies"]', $('#settings-form')).addEventListener('change', async event => { try { await api('/api/admin/settings', { method: 'PUT', body: JSON.stringify({ log_error_bodies: event.target.checked }) }); flash(event.target.checked ? 'Detailed error logging enabled.' : 'Detailed error logging disabled.'); } catch (error) { event.target.checked = !event.target.checked; $('#settings-error').textContent = errorMessage(error); } });
+$('[name="log_all_bodies"]', $('#settings-form')).addEventListener('change', async event => { try { await api('/api/admin/settings', { method: 'PUT', body: JSON.stringify({ log_all_bodies: event.target.checked }) }); flash(event.target.checked ? 'All message body logging enabled.' : 'All message body logging disabled.'); } catch (error) { event.target.checked = !event.target.checked; $('#settings-error').textContent = errorMessage(error); } });
 $('[name="notifications_auth_header"]', $('#notifications-form')).addEventListener('input', () => { authHeaderDirty = true; authHeaderClear = false; });
 $('#clear-notifications-auth').addEventListener('click', async () => { const button = $('#clear-notifications-auth'); button.disabled = true; $('#notifications-error').textContent = ''; try { await api('/api/admin/settings', { method: 'PUT', body: JSON.stringify({ notifications_auth_header: '' }) }); authHeaderClear = false; authHeaderDirty = false; $('[name="notifications_auth_header"]', $('#notifications-form')).value = ''; $('#notifications-auth-note').textContent = 'Authorization header cleared.'; $('#clear-notifications-auth').hidden = true; } catch (error) { $('#notifications-error').textContent = errorMessage(error); } finally { button.disabled = false; } });
 $('#send-test-notification').addEventListener('click', async () => { const button = $('#send-test-notification'); button.disabled = true; $('#notifications-error').textContent = ''; try { const nf = $('#notifications-form'); const body = { notifications_webhook_url: $('[name="notifications_webhook_url"]', nf).value || '' }; if (authHeaderDirty) body.notifications_auth_header = $('[name="notifications_auth_header"]', nf).value || ''; if (authHeaderClear) body.notifications_auth_header = ''; await api('/api/admin/settings', { method: 'PUT', body: JSON.stringify(body) }); authHeaderDirty = false; authHeaderClear = false; await api('/api/admin/notifications/test', { method: 'POST' }); flash('Test notification delivered.'); } catch (error) { $('#notifications-error').textContent = errorMessage(error); } finally { button.disabled = false; } });
@@ -3903,7 +4083,9 @@ function destroyActivityView() {
 // cells; state is always kept current so a reconcile paint on close/nav is
 // instant.
 const live = new LiveStream('/api/admin/live', { onAuthFailure: () => showLogin() });
-const liveRequests = new LiveRequests($('#view-activity'), { api, h, date, when: relativeAge, requestIdentity, rowCache });
+const liveRequests = new LiveRequests($('#view-activity'), { api, h, date, when: relativeAge, requestIdentity, rowCache, errorClassSummary, errorRouteLabel, activityErrorBox: options => liveErrors.run(() => activityErrorBox(options)),
+  removeErrorDetails: container => removeErrorDetails(container, liveErrors.details),
+});
 live.on('request', row => liveRequests.onRequest(row));
 live.on('connection', payload => liveRequests.setConnection(payload.state));
 let livePendingReconcile = false;
@@ -4208,8 +4390,8 @@ $$('dialog').forEach(dialog => dialog.addEventListener('close', () => {
 
 // Reconcile on view navigation so a freshly-rendered view reflects current state.
 const liveNavigate = navigate;
-navigate = function (view) {
-  liveNavigate(view);
+navigate = function (view, options) {
+  liveNavigate(view, options);
     if (liveViewActive('providers', 'virtual', 'clients')) reconcileLive();
   if (liveViewActive('activity') && activityGraphReady && activityGraphModule) {
     try { noteActivityCatalogueMiss(activityGraphModule.onSnapshotSeed({ inflight_client_routes: state.liveRoutes, inflight_targets: state.liveLegs })); } catch { /* pane update is best-effort */ }
@@ -4291,6 +4473,7 @@ async function setupAnalyticsConsent() {
     if (sessionHint()) showBootSkeleton();
     const runtime = await fetch('/api/runtime', { credentials: 'same-origin' }).then(res => res.json());
     runtimeMode = runtime.mode === 'hosted' ? 'hosted' : 'local';
+    $('#logging-privacy').hidden = runtimeMode !== 'hosted';
     if (runtimeMode === 'hosted') {
       $('#login-identity-label').firstChild.textContent = 'Email ';
       $('#login-submit').textContent = 'Sign in';
